@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interactive Feelings</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <!-- Text prose section -->
+  <section class="prose-section" data-section="intro">
+    <div class="prose-content">
+      <h1>Interactive Feelings</h1>
+      <p>
+        This is a scroll-based interactive multimedia article. As you scroll,
+        the Three.js scene will update based on your progress through each section.
+      </p>
+      <p>
+        The IntersectionObserver tracks when sections enter and exit the viewport,
+        enabling lazy-loading of media and efficient resource management.
+      </p>
+    </div>
+  </section>
+
+  <!-- Sticky Three.js section -->
+  <section class="threejs-section" data-section="scene">
+    <div class="scene-wrapper">
+      <div class="scene-sticky">
+        <canvas id="scene-canvas"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <!-- Video placeholder section -->
+  <section class="video-section" data-section="video">
+    <div class="video-content">
+      <h2>Video Section</h2>
+      <div class="video-placeholder" data-lazy-video="true">
+        <video
+          loop
+          muted
+          playsinline
+          data-src="assets/placeholder-video.mp4">
+        </video>
+        <p class="placeholder-text">Video placeholder - will lazy-load on enter</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Widget section -->
+  <section class="widget-section" data-section="widget">
+    <div class="widget-content">
+      <h2>Interactive Widget</h2>
+      <div class="widget-placeholder" data-lazy-widget="true">
+        <div class="widget-demo">
+          <p>Widget placeholder - initialized when visible</p>
+          <div class="widget-counter">
+            <button id="decrement">-</button>
+            <span id="count">0</span>
+            <button id="increment">+</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Final prose section -->
+  <section class="prose-section" data-section="outro">
+    <div class="prose-content">
+      <h2>The End</h2>
+      <p>
+        This demonstrates the core patterns: sticky scenes, intersection-based
+        lazy loading, and scroll progress tracking. Build your story from here.
+      </p>
+    </div>
+  </section>
+
+  <script type="module" src="/scroll.js"></script>
+
+</body>
+</html>
