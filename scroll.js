@@ -1,108 +1,23 @@
+import gsap from 'gsap';
+import { ScrollTrigger } from 'gsap/ScrollTrigger';
 import { initScene, updateScene } from './scene.js';
 
-// Scroll manager
+// Register ScrollTrigger plugin
+gsap.registerPlugin(ScrollTrigger);
+
+// Scroll manager with GSAP ScrollTrigger
 class ScrollManager {
   constructor() {
-    this.sections = new Map();
-    this.activeSection = null;
     this.sceneInitialized = false;
+    this.scrollTriggers = [];
 
     this.init();
   }
 
   init() {
-    this.setupIntersectionObserver();
-    this.setupScrollListener();
     this.initThreeScene();
+    this.setupScrollTriggers();
     this.initLazyElements();
-  }
-
-  // IntersectionObserver for section visibility
-  setupIntersectionObserver() {
-    const options = {
-      threshold: [0, 0.25, 0.5, 0.75, 1],
-      rootMargin: '0px'
-    };
-
-    this.observer = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        const section = entry.target;
-        const sectionName = section.dataset.section;
-
-        if (entry.isIntersecting) {
-          this.sections.set(sectionName, {
-            element: section,
-            isVisible: true,
-            ratio: entry.intersectionRatio
-          });
-
-          // Handle section-specific visibility events
-          this.onSectionEnter(section);
-        } else {
-          const sectionData = this.sections.get(sectionName);
-          if (sectionData) {
-            sectionData.isVisible = false;
-          }
-
-          this.onSectionExit(section);
-        }
-      });
-    }, options);
-
-    // Observe all sections
-    document.querySelectorAll('[data-section]').forEach(section => {
-      this.observer.observe(section);
-    });
-  }
-
-  // Scroll listener for continuous progress tracking
-  setupScrollListener() {
-    let ticking = false;
-
-    window.addEventListener('scroll', () => {
-      if (!ticking) {
-        window.requestAnimationFrame(() => {
-          this.updateScrollProgress();
-          ticking = false;
-        });
-        ticking = true;
-      }
-    });
-  }
-
-  updateScrollProgress() {
-    // Update Three.js scene progress if it's visible
-    const sceneSection = document.querySelector('[data-section="scene"]');
-    if (sceneSection) {
-      const progress = this.calculateSectionProgress(sceneSection);
-      if (progress !== null) {
-        updateScene(progress);
-      }
-    }
-  }
-
-  // Calculate scroll progress (0-1) for a section
-  calculateSectionProgress(section) {
-    const rect = section.getBoundingClientRect();
-    const windowHeight = window.innerHeight;
-
-    // Section hasn't entered yet
-    if (rect.top > windowHeight) {
-      return null;
-    }
-
-    // Section has completely passed
-    if (rect.bottom < 0) {
-      return null;
-    }
-
-    // Calculate progress based on wrapper height
-    const sectionHeight = rect.height;
-    const scrolled = windowHeight - rect.top;
-    const totalScrollDistance = sectionHeight + windowHeight;
-
-    const progress = Math.max(0, Math.min(1, scrolled / totalScrollDistance));
-    return progress;
   }
 
   // Initialize Three.js scene
@@ -114,7 +29,45 @@ class ScrollManager {
     }
   }
 
-  // Initialize lazy-loaded elements
+  // Setup GSAP ScrollTriggers
+  setupScrollTriggers() {
+    // Three.js scene scroll trigger
+    const sceneSection = document.querySelector('[data-section="scene"]');
+    if (sceneSection) {
+      const trigger = ScrollTrigger.create({
+        trigger: sceneSection,
+        start: 'top top',
+        end: 'bottom bottom',
+        scrub: true,
+        onUpdate: (self) => {
+          // self.progress gives us 0-1 as we scroll through the section
+          updateScene(self.progress);
+        },
+        onEnter: () => console.log('Scene section entered'),
+        onLeave: () => console.log('Scene section left'),
+        onEnterBack: () => console.log('Scene section entered (scrolling up)'),
+        onLeaveBack: () => console.log('Scene section left (scrolling up)')
+      });
+
+      this.scrollTriggers.push(trigger);
+    }
+
+    // Example: Add scroll triggers for other sections
+    const proseSection = document.querySelector('[data-section="intro"]');
+    if (proseSection) {
+      const trigger = ScrollTrigger.create({
+        trigger: proseSection,
+        start: 'top center',
+        end: 'bottom center',
+        onEnter: () => console.log('Intro section entered'),
+        onLeave: () => console.log('Intro section left')
+      });
+
+      this.scrollTriggers.push(trigger);
+    }
+  }
+
+  // Initialize lazy-loaded elements (keeping IntersectionObserver for efficiency)
   initLazyElements() {
     // Lazy video loading
     const lazyVideos = document.querySelectorAll('[data-lazy-video]');
@@ -184,14 +137,10 @@ class ScrollManager {
     }
   }
 
-  onSectionEnter(section) {
-    const sectionName = section.dataset.section;
-    console.log(`Section entered: ${sectionName}`);
-  }
-
-  onSectionExit(section) {
-    const sectionName = section.dataset.section;
-    console.log(`Section exited: ${sectionName}`);
+  // Cleanup method (useful if you need to destroy and recreate)
+  destroy() {
+    this.scrollTriggers.forEach(trigger => trigger.kill());
+    this.scrollTriggers = [];
   }
 }
 

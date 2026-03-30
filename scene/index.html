@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Three.js Scene Dev</title>
+  <link rel="stylesheet" href="/scene/style.css">
+</head>
+<body>
+
+  <div id="scene-container">
+    <canvas id="scene-canvas"></canvas>
+  </div>
+
+  <div id="inventory-overlay">
+    <div id="inventory-bar">
+      <img src="/assets/Images/inventorySlots.png" id="inventory-slots" />
+      <div id="slots-overlay">
+        <div class="slot" data-slot="0"></div>
+        <div class="slot" data-slot="1"></div>
+        <div class="slot" data-slot="2"></div>
+        <div class="slot" data-slot="3"></div>
+        <div class="slot" data-slot="4"></div>
+        <div class="slot" data-slot="5"></div>
+        <div class="slot" data-slot="6"></div>
+        <div class="slot" data-slot="7"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <h2>Scene Development</h2>
+    <p>Scroll Progress: <span id="progress-display">0.00</span></p>
+    <input
+      type="range"
+      id="progress-slider"
+      min="0"
+      max="100"
+      value="0"
+      step="0.1"
+    />
+    <div class="button-group">
+      <button id="reset-btn">Reset</button>
+      <button id="animate-btn">Auto Animate</button>
+    </div>
+  </div>
+
+  <script type="module" src="/scene/scene-dev.js"></script>
+
+</body>
+</html>
