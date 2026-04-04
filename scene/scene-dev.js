@@ -20,6 +20,20 @@ let tableTopY = 0;
 // Pick-up state (clicking existing scene stones)
 let pickedEntry = null;     // { mesh, body } being held
 
+// Mallet state
+let malletGroup = null;
+let malletHeld = false;
+let malletReturning = false;
+let malletRestPosition = new THREE.Vector3();
+let malletRestRotation = new THREE.Euler();
+// Spring state for fluid mallet movement
+const malletTargetPos = new THREE.Vector3();
+const malletVelocity = new THREE.Vector3();
+// Angular velocity for pendulum gravity effect
+const malletAngVel = new THREE.Vector2(); // x and z axis
+// Held drag plane at table-top height for mallet
+const malletDragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
 // Drag plane for 3D hover positioning
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
@@ -95,10 +109,12 @@ async function init() {
     controls.update();
 
     addTablePhysics(model);
+    loadMallet(box);
   });
 
-  loadSlotModel(0, '/assets/Models/stone.glb', 0.175);
-  loadSlotModel(1, '/assets/Models/stick.glb', 0.175);
+  loadSlotModel(0, '/assets/Models/stone.glb', 0.16);
+  loadSlotModel(1, '/assets/Models/stick.glb', 0.175, { x: 1.3, y: 1.3, z: 1.3 });
+  loadSlotModel(2, '/assets/Models/coal.glb', 0.16);
 
   controls = new OrbitControls(camera, canvas);
   controls.target.set(0, 0, 0);
@@ -115,6 +131,7 @@ async function init() {
 
   setSlotItem(0, '/assets/Images/stonePng.png');
   setSlotItem(1, '/assets/Images/stickPng.png');
+  setSlotItem(2, '/assets/Images/coalPng.png');
 }
 
 // ─── Table trimesh collider ───────────────────────────────────────────────────
@@ -146,16 +163,88 @@ function addTablePhysics(model) {
   });
 
   const tableBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
-  const colliderDesc = RAPIER.ColliderDesc
+  const trimeshDesc = RAPIER.ColliderDesc
     .trimesh(new Float32Array(verts), new Uint32Array(indices))
     .setRestitution(0.3)
+    .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max)
     .setFriction(0.6);
-  world.createCollider(colliderDesc, tableBody);
+  world.createCollider(trimeshDesc, tableBody);
+}
+
+// ─── Mallet placement ─────────────────────────────────────────────────────────
+
+function loadMallet(tableBox) {
+  loader.load('/assets/Models/mallet.glb', (gltf) => {
+    const raw = gltf.scene;
+    const mbox = new THREE.Box3().setFromObject(raw);
+    const center = mbox.getCenter(new THREE.Vector3());
+    const size = mbox.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+
+    // Offset so handle tip (bottom of model) is at group origin — pivot point for rotation
+    raw.position.sub(center);
+    raw.position.y += size.y / 2;  // shift up so bottom is at 0
+    const group = new THREE.Group();
+    group.add(raw);
+    const targetSize = 0.5;
+    group.scale.setScalar(targetSize / maxDim);
+
+    // Flip upside down (rest pose)
+    group.rotation.z = Math.PI;
+
+    const scaledHalfDepth = (size.z / maxDim) * targetSize / 2;
+    const restPos = new THREE.Vector3(
+      (tableBox.min.x + tableBox.max.x) / 2,
+      tableBox.min.y + (tableBox.max.y - tableBox.min.y) / 2,
+      tableBox.max.z + scaledHalfDepth
+    );
+    group.position.copy(restPos);
+
+    // Scaled half-height — used to offset grip point to handle tip
+    const scaledHalfHeight = (size.y / maxDim) * targetSize / 2;
+    malletGroup = group;
+    malletGroup.userData.halfHeight = scaledHalfHeight;
+
+    scene.add(group);
+    malletRestPosition.copy(restPos);
+    malletRestRotation.copy(group.rotation);
+    malletDragPlane.constant = -tableTopY;
+
+    // Click to grab
+    renderer.domElement.addEventListener('pointerdown', onMalletPointerDown);
+  });
+}
+
+function onMalletPointerDown(e) {
+  if (isDragging || pickedEntry || malletHeld || !malletGroup) return;
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+
+  const hits = raycaster.intersectObject(malletGroup, true);
+  if (hits.length === 0) return;
+
+  e.stopPropagation();
+  malletHeld = true;
+  malletReturning = false;
+  malletVelocity.set(0, 0, 0);
+  malletAngVel.set(0, 0);
+  controls.enabled = false;
+
+  // Flip right-side up when grabbed
+  malletGroup.rotation.set(0, 0, 0);
+
+  // Set target to current cursor position
+  const hit = new THREE.Vector3();
+  raycaster.ray.intersectPlane(malletDragPlane, hit);
+  malletTargetPos.copy(hit.length() > 0 ? hit : malletGroup.position);
 }
 
 // ─── Stone loading ────────────────────────────────────────────────────────────
 
-function loadSlotModel(slotIndex, path, targetSize) {
+function loadSlotModel(slotIndex, path, targetSize, axisScale = {}) {
   loader.load(
     path,
     (gltf) => {
@@ -169,7 +258,14 @@ function loadSlotModel(slotIndex, path, targetSize) {
 
       const group = new THREE.Group();
       group.add(raw);
-      if (maxDim > 0) group.scale.setScalar(targetSize / maxDim);
+      if (maxDim > 0) {
+        const s = targetSize / maxDim;
+        group.scale.set(
+          s * (axisScale.x ?? 1),
+          s * (axisScale.y ?? 1),
+          s * (axisScale.z ?? 1)
+        );
+      }
       group.visible = false;
       scene.add(group);
       slotTemplates[slotIndex] = group;
@@ -192,21 +288,50 @@ function loadSlotModel(slotIndex, path, targetSize) {
 function addStonePhysics(mesh) {
   const box = new THREE.Box3().setFromObject(mesh);
   const size = box.getSize(new THREE.Vector3());
+
+  const hx = size.x / 2;
+  const hy = size.y / 2;
+  const hz = size.z / 2;
+
   const { x, y, z } = mesh.position;
+  const q = mesh.quaternion;
 
   const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
     .setTranslation(x, y, z)
+    .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
     .setLinearDamping(0.2)
-    .setAngularDamping(0.2);
+    .setAngularDamping(0.05);
   const body = world.createRigidBody(bodyDesc);
 
   const colliderDesc = RAPIER.ColliderDesc
-    .cuboid(size.x / 2, size.y / 2, size.z / 2)
-    .setRestitution(0.3)
+    .cuboid(hx, hy, hz)
+    .setRestitution(0.05)
+    .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Min)
     .setFriction(0.6);
   world.createCollider(colliderDesc, body);
 
-  stoneBodies.push({ mesh, body });
+  // Add a tiny off-center bump at the base so sticks always tip over
+  if (mesh.userData.slotIndex === 1) {
+    const angle = Math.random() * Math.PI * 2;
+    const bumpOffset = 0.012;
+    const bumpDesc = RAPIER.ColliderDesc.ball(0.004)
+      .setTranslation(Math.cos(angle) * bumpOffset, -hy, Math.sin(angle) * bumpOffset);
+    world.createCollider(bumpDesc, body);
+  }
+
+  stoneBodies.push({ mesh, body, slotIndex: mesh.userData.slotIndex });
+}
+
+function nearVerticalQuat() {
+  // Base: undo the baked x=PI/2 rotation so stick points up in world space
+  const base = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI / 2, 0, 0));
+  // Small random tilt 15–20°
+  const maxAngle = (15 + Math.random() * 5) * (Math.PI / 180);
+  const tiltAngle = Math.random() * maxAngle;
+  const tiltAxis = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+  const tilt = new THREE.Quaternion().setFromAxisAngle(tiltAxis, tiltAngle);
+  base.premultiply(tilt);
+  return { x: base.x, y: base.y, z: base.z, w: base.w };
 }
 
 // ─── Drag-to-scene system ─────────────────────────────────────────────────────
@@ -232,6 +357,11 @@ function onSlotPointerDown(e) {
 
   dragStone = template.clone();
   dragStone.visible = false;
+  dragStone.userData.slotIndex = parseInt(slotIndex);
+  if (dragStone.userData.slotIndex === 1) {
+    const q = nearVerticalQuat();
+    dragStone.quaternion.set(q.x, q.y, q.z, q.w);
+  }
   scene.add(dragStone);
 
   dragGhost = document.createElement('div');
@@ -265,6 +395,11 @@ function onCanvasPointerDown(e) {
   pickedEntry = entry;
   controls.enabled = false;
   entry.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+
+  // Snap stick to near-vertical on pick-up
+  if (entry.slotIndex === 1) {
+    entry.body.setNextKinematicRotation(nearVerticalQuat());
+  }
 
   // Snap to cursor immediately without waiting for pointermove
   const hit = new THREE.Vector3();
@@ -300,6 +435,18 @@ function positionStoneAtCursor(clientX, clientY) {
 }
 
 function onPointerMove(e) {
+  if (malletHeld && malletGroup) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const hit = new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(malletDragPlane, hit)) {
+      malletTargetPos.copy(hit);
+    }
+    return;
+  }
+
   if (pickedEntry) {
     const rect = renderer.domElement.getBoundingClientRect();
     mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -320,14 +467,22 @@ function onPointerMove(e) {
   if (isOverCanvas(e.clientX, e.clientY)) {
     dragStone.visible = true;
     positionStoneAtCursor(e.clientX, e.clientY);
-    if (dragGhost) dragGhost.style.opacity = '0.25';
+    if (dragGhost) dragGhost.style.display = 'none';
   } else {
     dragStone.visible = false;
-    if (dragGhost) dragGhost.style.opacity = '1';
+    if (dragGhost) dragGhost.style.display = '';
   }
 }
 
 function onPointerUp(e) {
+  if (malletHeld && malletGroup) {
+    malletHeld = false;
+    malletReturning = true;
+    malletVelocity.set(0, 0, 0);
+    controls.enabled = true;
+    return;
+  }
+
   if (pickedEntry) {
     pickedEntry.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
     pickedEntry.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
@@ -365,6 +520,41 @@ function updatePhysics() {
   }
 }
 
+// ─── Mallet update ────────────────────────────────────────────────────────────
+
+function updateMallet(dt) {
+  if (!malletGroup) return;
+
+  if (malletHeld) {
+    // Pin tip (group origin) exactly to cursor
+    const prevPos = malletGroup.position.clone();
+    malletGroup.position.copy(malletTargetPos);
+
+    // Smooth velocity via exponential moving average
+    const cursorDelta = malletGroup.position.clone().sub(prevPos);
+    const instantVel = cursorDelta.divideScalar(Math.max(dt, 0.001));
+    malletVelocity.lerp(instantVel, 0.08);
+
+    // Single axis swing on Z
+    malletAngVel.x += malletVelocity.x * 8 * dt;
+    malletAngVel.x *= 0.88;
+    malletGroup.rotation.z += malletAngVel.x;
+
+  } else if (malletReturning) {
+    // Lerp back to rest position and rotation
+    malletGroup.position.lerp(malletRestPosition, 0.08);
+    malletGroup.rotation.x += (malletRestRotation.x - malletGroup.rotation.x) * 0.08;
+    malletGroup.rotation.y += (malletRestRotation.y - malletGroup.rotation.y) * 0.08;
+    malletGroup.rotation.z += (malletRestRotation.z - malletGroup.rotation.z) * 0.08;
+
+    if (malletGroup.position.distanceTo(malletRestPosition) < 0.001) {
+      malletGroup.position.copy(malletRestPosition);
+      malletGroup.rotation.copy(malletRestRotation);
+      malletReturning = false;
+    }
+  }
+}
+
 // ─── Scene loop ───────────────────────────────────────────────────────────────
 
 function updateScene(progress) {
@@ -375,9 +565,10 @@ function updateScene(progress) {
 
 function animate() {
   animationId = requestAnimationFrame(animate);
-  clock.getDelta(); // keep clock ticking for future use
+  const dt = Math.min(clock.getDelta(), 0.05);
 
   updatePhysics();
+  updateMallet(dt);
 
   if (autoAnimate) {
     currentProgress += 0.002;

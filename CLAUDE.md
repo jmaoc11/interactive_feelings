@@ -36,6 +36,10 @@ assets/
     craftingtable.glb
     stone.glb
     stick.glb
+    coal.glb
+    mallet.glb
+  Images/
+    coalPng.png         (500×500px)
 ```
 
 ## Main Article (`scroll.js` / `scene.js`)
@@ -65,23 +69,42 @@ assets/
   - `loadSlotModel(index, '/assets/Models/foo.glb', targetSize)` — register a GLB for a slot
   - Call inside `init()` or after DOM ready (not bare module scope)
 
+## Mallet Interaction (`scene/scene-dev.js`)
+- Loaded after table GLB so `tableBox` bbox is available for flush positioning
+- Rest pose: `rotation.z = Math.PI` (upside down), flush against `+Z` face of table
+- Pivot at handle tip: offset `raw.position.y += size.y / 2` after centering so group origin = handle tip
+- Held: tip pinned exactly to cursor each frame (no spring on position); head swings on Z axis via angular velocity
+- Angular velocity accumulates from `malletVelocity.x * 8 * dt`, decays with `*= 0.88` each frame
+- Cursor velocity smoothed via EMA (`lerp(instantVel, 0.08)`) to avoid jerkiness
+- On release: `malletReturning = true` — lerps position + rotation back to rest pose
+- `malletDragPlane.constant = -tableTopY` — mallet follows table surface plane when held
+
 ## Physics (Rapier)
 - `@dimforge/rapier3d-compat` — imported as ES module, WASM embedded (no script tag needed)
-- Init: `await RAPIER.init()` then `new RAPIER.World({ x: 0, y: -9.81, z: 0 })`
+- Init: `await RAPIER.init()` then `new RAPIER.World({ x: 0, y: -2.5, z: 0 })` — intentionally low gravity for scene scale
 - `world.step()` each frame (fixed internal timestep, no delta needed)
 - Table: `RigidBodyDesc.fixed()` + `ColliderDesc.trimesh(Float32Array verts, Uint32Array indices)`
 - Stones: `RigidBodyDesc.dynamic().setLinearDamping(...).setAngularDamping(...)` + `ColliderDesc.cuboid(hx, hy, hz)`
 - Sync: `body.translation()` → `mesh.position`, `body.rotation()` → `mesh.quaternion`
 - Call `model.updateMatrixWorld(true)` before extracting triangle data for the trimesh collider
+- Pass mesh quaternion to `RigidBodyDesc.setRotation()` — otherwise body initializes with identity rotation regardless of mesh orientation
+- Restitution combine rules: table uses `CoefficientCombineRule.Max`, objects use `CoefficientCombineRule.Min` — gives table bounce without object-object bounce
+- Object-object collisions are intentionally less bouncy than object-table; don't flatten restitution globally
 
 ## GLB Models
 - GLB origins are often **not centered** — always wrap in a pivot `Group`, offset `raw.position.sub(center)` after computing bbox, then scale the group
 - `stone.glb` has maxDim ~34 units (very large model-space); scale to `targetSize / maxDim`
 - Compute `THREE.Box3` **before** applying scale so `maxDim` reflects unscaled geometry
+- `stick.glb` long axis is horizontal by default — apply `raw.rotation.x = Math.PI / 2` before bbox to orient vertically
+- For sticks: store `slotIndex` on `mesh.userData` to identify them for special physics handling (near-vertical spawn, tip impulse)
+- To make a stick always topple: add a small off-center `ColliderDesc.ball` collider attached to the same body
+- `loadSlotModel` accepts optional `axisScale` (`{x,y,z}` multipliers) and `rotation` (`{x,y,z}` radians) params
 
 ## Drag-to-3D Interaction (`scene/scene-dev.js`)
 - `#inventory-overlay` has `pointer-events: none`; individual `.slot` elements need `pointer-events: auto` to be clickable
 - Drag ghost: a `position: fixed` div appended to `<body>`, `transform: translate(-50%, -50%)`, `pointer-events: none`
+- Hide ghost with `display: none` (not opacity) when over canvas — opacity just fades it, doesn't remove it from view
+- Tag cloned dragStone with `userData.slotIndex` at clone time so physics body can identify item type on drop
 - `slotTemplates[index]` map holds hidden GLB templates; each drag clones the template for that slot index
 - `controls.enabled = false` on drag start, `true` on release — prevents OrbitControls fighting pointer events
 - Drop plane: `new THREE.Plane(new THREE.Vector3(0,1,0), 0)` — set `constant = -(tableTopY + 0.4)` after table loads
