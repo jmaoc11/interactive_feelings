@@ -6,6 +6,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 // Scene, camera, renderer
 let scene, camera, renderer, controls;
 let animationId = null;
+let lastDt = 0.016;
 let autoAnimate = false;
 let currentProgress = 0;
 let objects = [];
@@ -19,6 +20,15 @@ let tableTopY = 0;
 
 // Pick-up state (clicking existing scene stones)
 let pickedEntry = null;     // { mesh, body } being held
+const pickedTargetPos = new THREE.Vector3();   // raw cursor position
+const pickedCurrentPos = new THREE.Vector3();  // spring follow position
+const pickedSpringVel = new THREE.Vector3();   // spring velocity (causes overshoot)
+const pickedTargetVel = new THREE.Vector3();   // smoothed cursor velocity for throw
+const pickedTargetPrev = new THREE.Vector3();
+const pickedPosPrev = new THREE.Vector3();     // previous spring position for velocity tracking
+// Pendulum hang offset
+const hangOffset = new THREE.Vector3();        // current XZ swing offset
+const hangVel = new THREE.Vector3();           // pendulum velocity
 
 // Mallet state
 let malletGroup = null;
@@ -26,13 +36,31 @@ let malletHeld = false;
 let malletReturning = false;
 let malletRestPosition = new THREE.Vector3();
 let malletRestRotation = new THREE.Euler();
-// Spring state for fluid mallet movement
+// Cursor tracking for mallet
 const malletTargetPos = new THREE.Vector3();
+const malletCurrentPos = new THREE.Vector3();
+let malletLagFactor = 0.13;
 const malletVelocity = new THREE.Vector3();
-// Angular velocity for pendulum gravity effect
-const malletAngVel = new THREE.Vector2(); // x and z axis
+const malletPrevVelocity = new THREE.Vector3();
+// Swing animation state
+let malletSwinging = false;
+let malletSwingT = 0;          // 0→1 animation progress
+let malletSwingDir = 1;        // +1 down, -1 up
+let malletBaseRotZ = 0;        // rotation.z at swing start
+const SWING_ANGLE = Math.PI * 0.5;   // 90° arc
+const SWING_DURATION = 0.38;         // seconds
+// Flick detection: rolling window of recent screen-Y deltas
+const flickWindow = [];              // { dy, t } entries (screen pixels, timestamp)
+const FLICK_WINDOW_MS = 100;         // look back this far
+const FLICK_THRESHOLD_PX = 70;      // net downward px displacement to trigger swing
+const FLICK_DIRECTION_RATIO = 0.6;  // net dy must be >= 60% of total abs movement (mostly downward)
 // Held drag plane at table-top height for mallet
 const malletDragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+// Handle grip offset (fraction of full length above tip)
+const GRIP_OFFSET_FRAC = 0.25;
+const THROW_SCALE = 0.5;
+const GRAB_STIFFNESS = 400;
+const GRAB_DAMPING = 28;
 
 // Drag plane for 3D hover positioning
 const raycaster = new THREE.Raycaster();
@@ -186,7 +214,7 @@ function loadMallet(tableBox) {
     raw.position.y += size.y / 2;  // shift up so bottom is at 0
     const group = new THREE.Group();
     group.add(raw);
-    const targetSize = 0.5;
+    const targetSize = 0.625;
     group.scale.setScalar(targetSize / maxDim);
 
     // Flip upside down (rest pose)
@@ -229,12 +257,19 @@ function onMalletPointerDown(e) {
   e.stopPropagation();
   malletHeld = true;
   malletReturning = false;
+  malletSwinging = false;
+  renderer.domElement.style.cursor = 'grabbing';
   malletVelocity.set(0, 0, 0);
-  malletAngVel.set(0, 0);
+  malletPrevVelocity.set(0, 0, 0);
+  flickWindow.length = 0;
+  _prevClientY = null;
+  _prevClientX = null;
+  _malletTilt = 0;
+  malletCurrentPos.copy(malletTargetPos);
   controls.enabled = false;
 
-  // Flip right-side up when grabbed
-  malletGroup.rotation.set(0, 0, 0);
+  // Flip right-side up when grabbed, rotated 20° on Y
+  malletGroup.rotation.set(0, -30 * (Math.PI / 180), 0);
 
   // Set target to current cursor position
   const hit = new THREE.Vector3();
@@ -320,6 +355,7 @@ function addStonePhysics(mesh) {
   }
 
   stoneBodies.push({ mesh, body, slotIndex: mesh.userData.slotIndex });
+  return body;
 }
 
 function nearVerticalQuat() {
@@ -353,7 +389,10 @@ function onSlotPointerDown(e) {
 
   e.preventDefault();
   isDragging = true;
+  dragStoneInitialized = false;
+  dragStoneVel.set(0, 0, 0);
   controls.enabled = false;
+  renderer.domElement.style.cursor = 'grabbing';
 
   dragStone = template.clone();
   dragStone.visible = false;
@@ -394,18 +433,21 @@ function onCanvasPointerDown(e) {
   e.stopPropagation();
   pickedEntry = entry;
   controls.enabled = false;
+  renderer.domElement.style.cursor = 'grabbing';
   entry.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
 
-  // Snap stick to near-vertical on pick-up
-  if (entry.slotIndex === 1) {
-    entry.body.setNextKinematicRotation(nearVerticalQuat());
-  }
-
-  // Snap to cursor immediately without waiting for pointermove
   const hit = new THREE.Vector3();
   if (raycaster.ray.intersectPlane(dragPlane, hit)) {
+    pickedTargetPos.copy(hit);
+    pickedCurrentPos.copy(hit);
+    pickedTargetPrev.copy(hit);
+    pickedPosPrev.copy(hit);
     entry.body.setNextKinematicTranslation({ x: hit.x, y: hit.y, z: hit.z });
   }
+  pickedTargetVel.set(0, 0, 0);
+  pickedSpringVel.set(0, 0, 0);
+  hangOffset.set(0, 0, 0);
+  hangVel.set(0, 0, 0);
 }
 
 function moveDragGhost(x, y) {
@@ -419,6 +461,11 @@ function isOverCanvas(x, y) {
   return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
 }
 
+const dragStoneTargetPos = new THREE.Vector3();
+const dragStoneCurrentPos = new THREE.Vector3();
+const dragStoneVel = new THREE.Vector3();
+let dragStoneInitialized = false;
+
 function positionStoneAtCursor(clientX, clientY) {
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
@@ -426,13 +473,21 @@ function positionStoneAtCursor(clientX, clientY) {
 
   raycaster.setFromCamera(mouse, camera);
   const hit = new THREE.Vector3();
-  if (raycaster.ray.intersectPlane(dragPlane, hit)) {
-    dragStone.position.copy(hit);
-  } else {
+  if (!raycaster.ray.intersectPlane(dragPlane, hit)) {
     raycaster.ray.at(4, hit);
-    dragStone.position.copy(hit);
   }
+
+  if (!dragStoneInitialized) {
+    dragStoneCurrentPos.copy(hit);
+    dragStoneVel.set(0, 0, 0);
+    dragStoneInitialized = true;
+  }
+  dragStoneTargetPos.copy(hit);
 }
+
+let _prevClientY = null;
+let _prevClientX = null;
+let _malletTilt = 0;  // current tilt angle (radians), lerped each frame
 
 function onPointerMove(e) {
   if (malletHeld && malletGroup) {
@@ -444,6 +499,46 @@ function onPointerMove(e) {
     if (raycaster.ray.intersectPlane(malletDragPlane, hit)) {
       malletTargetPos.copy(hit);
     }
+
+    // Track screen deltas for tilt and flick detection
+    if (!malletSwinging) {
+      const now = performance.now();
+      const dx = _prevClientX !== null ? e.clientX - _prevClientX : 0;
+      const dy = _prevClientY !== null ? e.clientY - _prevClientY : 0;
+      _prevClientX = e.clientX;
+      _prevClientY = e.clientY;
+
+      // Tilt: moving right → tilt left (negative Z), moving left → tilt right (positive Z)
+      // dx in screen pixels per frame; scale to radians, clamp to ±18°
+      const MAX_TILT = 18 * (Math.PI / 180);
+      const tiltTarget = Math.max(-MAX_TILT, Math.min(MAX_TILT, dx * 0.18));
+      _malletTilt = _malletTilt + (tiltTarget - _malletTilt) * 0.12;
+
+      if (dy !== 0) flickWindow.push({ dy, t: now });
+      // Also track X for horizontal flick detection
+      if (dx !== 0) flickWindow.push({ dy: 0, dx, t: now });
+
+      // Prune old entries
+      const cutoff = now - FLICK_WINDOW_MS;
+      while (flickWindow.length && flickWindow[0].t < cutoff) flickWindow.shift();
+
+      // Sum displacement in window
+      const netDy = flickWindow.reduce((s, f) => s + f.dy, 0);
+      const netDx = flickWindow.reduce((s, f) => s + (f.dx ?? 0), 0);
+      const absDx = flickWindow.reduce((s, f) => s + Math.abs(f.dx ?? 0), 0);
+      // Trigger on leftward horizontal flick (right-to-left, negative netDx)
+      const isLeftFlick = netDx <= -FLICK_THRESHOLD_PX && absDx > 0 && (-netDx / absDx) >= FLICK_DIRECTION_RATIO;
+      // Only trigger on downward flick with mostly-downward motion
+      if (isLeftFlick && netDy >= FLICK_THRESHOLD_PX) {
+        malletSwinging = true;
+        malletSwingT = 0;
+        malletSwingDir = 1; // always swing down
+        malletBaseRotZ = malletGroup.rotation.z;
+        flickWindow.length = 0;
+        _prevClientY = null;
+        _prevClientX = null;
+      }
+    }
     return;
   }
 
@@ -454,9 +549,23 @@ function onPointerMove(e) {
     raycaster.setFromCamera(mouse, camera);
     const hit = new THREE.Vector3();
     if (raycaster.ray.intersectPlane(dragPlane, hit)) {
-      pickedEntry.body.setNextKinematicTranslation({ x: hit.x, y: hit.y, z: hit.z });
+      pickedTargetPos.copy(hit);
     }
     return;
+  }
+
+  // Hover cursor — check if over mallet or any scene object
+  if (!isDragging && isOverCanvas(e.clientX, e.clientY)) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+
+    const hoverTargets = [...stoneBodies.map(s => s.mesh), ...(malletGroup ? [malletGroup] : [])];
+    const hits = raycaster.intersectObjects(hoverTargets, true);
+    renderer.domElement.style.cursor = hits.length > 0 ? 'grab' : '';
+  } else if (!isDragging) {
+    renderer.domElement.style.cursor = '';
   }
 
   if (!isDragging) return;
@@ -480,25 +589,34 @@ function onPointerUp(e) {
     malletReturning = true;
     malletVelocity.set(0, 0, 0);
     controls.enabled = true;
+    renderer.domElement.style.cursor = '';
     return;
   }
 
   if (pickedEntry) {
     pickedEntry.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
-    pickedEntry.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-    pickedEntry.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    const tv = pickedTargetVel;
+    pickedEntry.body.setLinvel({
+      x: tv.x * THROW_SCALE, y: tv.y * THROW_SCALE, z: tv.z * THROW_SCALE
+    }, true);
+    pickedEntry.body.setAngvel({
+      x: tv.z * THROW_SCALE * 4, y: 0, z: -tv.x * THROW_SCALE * 4
+    }, true);
     pickedEntry = null;
     controls.enabled = true;
+    renderer.domElement.style.cursor = '';
     return;
   }
 
   if (!isDragging) return;
   isDragging = false;
+  renderer.domElement.style.cursor = '';
 
   if (dragGhost) { dragGhost.remove(); dragGhost = null; }
 
   if (dragStone && dragStone.visible && isOverCanvas(e.clientX, e.clientY)) {
-    addStonePhysics(dragStone);
+    const body = addStonePhysics(dragStone);
+    body.setLinvel({ x: dragStoneVel.x * THROW_SCALE, y: dragStoneVel.y * THROW_SCALE, z: dragStoneVel.z * THROW_SCALE }, true);
   } else {
     if (dragStone) scene.remove(dragStone);
   }
@@ -510,6 +628,32 @@ function onPointerUp(e) {
 
 function updatePhysics() {
   if (!world) return;
+
+  if (pickedEntry) {
+    // Spring toward cursor
+    const diff = pickedTargetPos.clone().sub(pickedCurrentPos);
+    pickedSpringVel.addScaledVector(diff, GRAB_STIFFNESS * lastDt);
+    pickedSpringVel.addScaledVector(pickedSpringVel, -GRAB_DAMPING * lastDt);
+    pickedCurrentPos.addScaledVector(pickedSpringVel, lastDt);
+
+
+    // const xzSpeed = Math.sqrt(
+    //   pickedTargetVel.x * pickedTargetVel.x + pickedTargetVel.z * pickedTargetVel.z
+    // );
+    // const sag = Math.min(xzSpeed * 0.04, 0.18);
+    pickedEntry.body.setNextKinematicTranslation({
+      x: pickedCurrentPos.x,
+      y: pickedCurrentPos.y,
+      z: pickedCurrentPos.z
+    });
+
+    // Track actual spring position velocity for throw on release
+    const posDelta = pickedCurrentPos.clone().sub(pickedPosPrev);
+    const instantVel = posDelta.divideScalar(Math.max(lastDt, 0.001));
+    pickedTargetVel.lerp(instantVel, 0.5);
+    pickedPosPrev.copy(pickedCurrentPos);
+  }
+
   world.step();
 
   for (const { mesh, body } of stoneBodies) {
@@ -522,23 +666,45 @@ function updatePhysics() {
 
 // ─── Mallet update ────────────────────────────────────────────────────────────
 
+function updateDragStoneSpring(dt) {
+  if (!isDragging || !dragStone || !dragStone.visible || !dragStoneInitialized) return;
+  const diff = dragStoneTargetPos.clone().sub(dragStoneCurrentPos);
+  dragStoneVel.addScaledVector(diff, GRAB_STIFFNESS * dt);
+  dragStoneVel.addScaledVector(dragStoneVel, -GRAB_DAMPING * dt);
+  dragStoneCurrentPos.addScaledVector(dragStoneVel, dt);
+  dragStone.position.copy(dragStoneCurrentPos);
+}
+
 function updateMallet(dt) {
   if (!malletGroup) return;
 
+  const halfHeight = malletGroup.userData.halfHeight ?? 0;
+  // Grip offset in local space: positive Y moves the hold point up the handle
+  const gripOffset = halfHeight * GRIP_OFFSET_FRAC * 2;
+
   if (malletHeld) {
-    // Pin tip (group origin) exactly to cursor
-    const prevPos = malletGroup.position.clone();
-    malletGroup.position.copy(malletTargetPos);
+    // Lag position toward cursor — feels like dragging a weighted object
+    malletCurrentPos.lerp(malletTargetPos, malletLagFactor);
+    malletGroup.position.copy(malletCurrentPos);
+    malletGroup.position.y -= gripOffset;
 
-    // Smooth velocity via exponential moving average
-    const cursorDelta = malletGroup.position.clone().sub(prevPos);
-    const instantVel = cursorDelta.divideScalar(Math.max(dt, 0.001));
-    malletVelocity.lerp(instantVel, 0.08);
-
-    // Single axis swing on Z
-    malletAngVel.x += malletVelocity.x * 8 * dt;
-    malletAngVel.x *= 0.88;
-    malletGroup.rotation.z += malletAngVel.x;
+    // Apply swing animation (overrides free rotation while active)
+    if (malletSwinging) {
+      malletSwingT += dt / SWING_DURATION;
+      if (malletSwingT >= 1) {
+        malletSwingT = 1;
+        malletSwinging = false;
+      }
+      // Ease-in-out cubic
+      const ease = malletSwingT < 0.5
+        ? 4 * malletSwingT * malletSwingT * malletSwingT
+        : 1 - Math.pow(-2 * malletSwingT + 2, 3) / 2;
+      malletGroup.rotation.z = malletBaseRotZ + malletSwingDir * SWING_ANGLE * ease;
+    } else {
+      // Decay tilt back toward 0 when not moving
+      _malletTilt *= 0.90;
+      malletGroup.rotation.z += (_malletTilt - malletGroup.rotation.z) * 0.08;
+    }
 
   } else if (malletReturning) {
     // Lerp back to rest position and rotation
@@ -566,9 +732,11 @@ function updateScene(progress) {
 function animate() {
   animationId = requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
+  lastDt = dt;
 
   updatePhysics();
   updateMallet(dt);
+  updateDragStoneSpring(dt);
 
   if (autoAnimate) {
     currentProgress += 0.002;
@@ -597,6 +765,13 @@ function setupControls() {
   });
 
   resetBtn.addEventListener('click', () => updateScene(0));
+
+  const lagSlider = document.getElementById('lag-slider');
+  const lagDisplay = document.getElementById('lag-display');
+  lagSlider.addEventListener('input', (e) => {
+    malletLagFactor = parseFloat(e.target.value);
+    lagDisplay.textContent = malletLagFactor.toFixed(2);
+  });
 
   animateBtn.addEventListener('click', () => {
     autoAnimate = !autoAnimate;
