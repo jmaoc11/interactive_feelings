@@ -30,6 +30,12 @@ const pickedPosPrev = new THREE.Vector3();     // previous spring position for v
 const hangOffset = new THREE.Vector3();        // current XZ swing offset
 const hangVel = new THREE.Vector3();           // pendulum velocity
 
+// Idle rotation when holding an object
+const HELD_IDLE_ROTATION = false;              // toggle to enable slow idle spin while held
+const heldIdleQuat = new THREE.Quaternion();   // accumulated idle rotation
+const heldIdleAxis = new THREE.Vector3();      // current rotation axis
+let heldIdleSpeed = 0;                         // radians/sec
+
 // Mallet state
 let malletGroup = null;
 let malletHeld = false;
@@ -51,9 +57,9 @@ const SWING_ANGLE = Math.PI * 0.5;   // 90° arc
 const SWING_DURATION = 0.38;         // seconds
 // Flick detection: rolling window of recent screen-Y deltas
 const flickWindow = [];              // { dy, t } entries (screen pixels, timestamp)
-const FLICK_WINDOW_MS = 100;         // look back this far
-const FLICK_THRESHOLD_PX = 70;      // net downward px displacement to trigger swing
-const FLICK_DIRECTION_RATIO = 0.6;  // net dy must be >= 60% of total abs movement (mostly downward)
+const FLICK_WINDOW_MS = 85;          // look back this far
+const FLICK_THRESHOLD_PX = 138;     // net downward px displacement to trigger swing
+const FLICK_DIRECTION_RATIO = 0.72; // net dy must be >= 72% of total abs movement (mostly downward)
 // Held drag plane at table-top height for mallet
 const malletDragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 // Handle grip offset (fraction of full length above tip)
@@ -223,7 +229,7 @@ function loadMallet(tableBox) {
     const scaledHalfDepth = (size.z / maxDim) * targetSize / 2;
     const restPos = new THREE.Vector3(
       (tableBox.min.x + tableBox.max.x) / 2,
-      tableBox.min.y + (tableBox.max.y - tableBox.min.y) / 2,
+      tableBox.max.y - 0.05,
       tableBox.max.z + scaledHalfDepth
     );
     group.position.copy(restPos);
@@ -236,7 +242,7 @@ function loadMallet(tableBox) {
     scene.add(group);
     malletRestPosition.copy(restPos);
     malletRestRotation.copy(group.rotation);
-    malletDragPlane.constant = -tableTopY;
+    malletDragPlane.constant = -(tableTopY + 0.1);
 
     // Click to grab
     renderer.domElement.addEventListener('pointerdown', onMalletPointerDown);
@@ -370,6 +376,25 @@ function nearVerticalQuat() {
   return { x: base.x, y: base.y, z: base.z, w: base.w };
 }
 
+// ─── Held idle rotation ───────────────────────────────────────────────────────
+
+function resetHeldIdle(mesh) {
+  // Seed idle rotation from current mesh orientation so there's no snap
+  heldIdleQuat.copy(mesh.quaternion);
+  // Pick a random axis and speed (0.4–0.9 rad/s)
+  heldIdleAxis.set(
+    Math.random() - 0.5,
+    Math.random() - 0.5,
+    Math.random() - 0.5
+  ).normalize();
+  heldIdleSpeed = 0.4 + Math.random() * 0.5;
+}
+
+function updateHeldIdle(dt) {
+  const delta = new THREE.Quaternion().setFromAxisAngle(heldIdleAxis, heldIdleSpeed * dt);
+  heldIdleQuat.multiply(delta);
+}
+
 // ─── Drag-to-scene system ─────────────────────────────────────────────────────
 
 function setupDrag() {
@@ -402,6 +427,7 @@ function onSlotPointerDown(e) {
     dragStone.quaternion.set(q.x, q.y, q.z, q.w);
   }
   scene.add(dragStone);
+  if (HELD_IDLE_ROTATION) resetHeldIdle(dragStone);
 
   dragGhost = document.createElement('div');
   dragGhost.id = 'drag-ghost';
@@ -435,6 +461,7 @@ function onCanvasPointerDown(e) {
   controls.enabled = false;
   renderer.domElement.style.cursor = 'grabbing';
   entry.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+  if (HELD_IDLE_ROTATION) resetHeldIdle(entry.mesh);
 
   const hit = new THREE.Vector3();
   if (raycaster.ray.intersectPlane(dragPlane, hit)) {
@@ -641,10 +668,17 @@ function updatePhysics() {
     //   pickedTargetVel.x * pickedTargetVel.x + pickedTargetVel.z * pickedTargetVel.z
     // );
     // const sag = Math.min(xzSpeed * 0.04, 0.18);
+    if (HELD_IDLE_ROTATION) updateHeldIdle(lastDt);
     pickedEntry.body.setNextKinematicTranslation({
       x: pickedCurrentPos.x,
       y: pickedCurrentPos.y,
       z: pickedCurrentPos.z
+    });
+    if (HELD_IDLE_ROTATION) pickedEntry.body.setNextKinematicRotation({
+      x: heldIdleQuat.x,
+      y: heldIdleQuat.y,
+      z: heldIdleQuat.z,
+      w: heldIdleQuat.w
     });
 
     // Track actual spring position velocity for throw on release
@@ -673,6 +707,7 @@ function updateDragStoneSpring(dt) {
   dragStoneVel.addScaledVector(dragStoneVel, -GRAB_DAMPING * dt);
   dragStoneCurrentPos.addScaledVector(dragStoneVel, dt);
   dragStone.position.copy(dragStoneCurrentPos);
+  if (HELD_IDLE_ROTATION) { updateHeldIdle(dt); dragStone.quaternion.copy(heldIdleQuat); }
 }
 
 function updateMallet(dt) {
