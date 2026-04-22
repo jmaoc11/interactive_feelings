@@ -34,6 +34,8 @@ assets/
     stickPng.png        (500×500px, no baked-in padding)
   Models/
     craftingtable.glb
+    craftingslots.glb       (empty Object3Ds Slot1–Slot9, position markers only)
+    craftingslotsfill.glb   (plane meshes Slot1–Slot9 filling each slot hole, used for edge extraction)
     stone.glb
     stick.glb
     coal.glb
@@ -73,23 +75,34 @@ assets/
 - Loaded after table GLB so `tableBox` bbox is available for flush positioning
 - Rest pose: `rotation.z = Math.PI` (upside down), flush against `+Z` face of table
 - Pivot at handle tip: offset `raw.position.y += size.y / 2` after centering so group origin = handle tip
-- Held: tip pinned exactly to cursor each frame (no spring on position); head swings on Z axis via angular velocity
-- Angular velocity accumulates from `malletVelocity.x * 8 * dt`, decays with `*= 0.88` each frame
-- Cursor velocity smoothed via EMA (`lerp(instantVel, 0.08)`) to avoid jerkiness
-- On release: `malletReturning = true` — lerps position + rotation back to rest pose
-- `malletDragPlane.constant = -tableTopY` — mallet follows table surface plane when held
+- **Two body-type modes** to avoid table clipping on return:
+  - **Held**: `RigidBodyType.Dynamic` with `gravityScale(0)` — spring force (`MALLET_STIFFNESS` / `MALLET_DAMPING`) chases cursor, real two-way collisions with stones
+  - **Returning/rest**: `RigidBodyType.KinematicPositionBased` — lerps position + rotation back to rest pose, no collision interference
+  - Switch to dynamic on grab, kinematic on release
+- Spring-damper PD controller: `addForce(stiffness * (target - pos) - damping * vel)` each frame when held
+- Grip offset (`GRIP_OFFSET_FRAC`) applied to spring target Y so hold point is partway up the handle, not at tip
+- Zero body `linvel` on release so leftover momentum doesn't affect the kinematic return
+- Rotation always controlled visually (tilt, swing, bounce-back) and synced TO body via `setRotation` + `setAngvel(0)`
+- `malletDragPlane.constant = -(tableTopY + N)` — controls hold height above table; currently +0.2
+- Update order: `updateMallet(dt)` runs before `updatePhysics()` so rotation is computed before the physics step
+- **Mallet is click-toggle**: click to grab, click anywhere on canvas to drop (handled in `onMalletPointerDown`)
 
 ## Physics (Rapier)
 - `@dimforge/rapier3d-compat` — imported as ES module, WASM embedded (no script tag needed)
 - Init: `await RAPIER.init()` then `new RAPIER.World({ x: 0, y: -2.5, z: 0 })` — intentionally low gravity for scene scale
 - `world.step()` each frame (fixed internal timestep, no delta needed)
 - Table: `RigidBodyDesc.fixed()` + `ColliderDesc.trimesh(Float32Array verts, Uint32Array indices)`
-- Stones: `RigidBodyDesc.dynamic().setLinearDamping(...).setAngularDamping(...)` + `ColliderDesc.cuboid(hx, hy, hz)`
-- Sync: `body.translation()` → `mesh.position`, `body.rotation()` → `mesh.quaternion`
+- Stones/coal: `ColliderDesc.cuboid(hx, hy, hz)`; **sticks**: `ColliderDesc.capsule(hy - radius, radius).setRotation(PI/2 around X)` — capsule avoids corner-clipping through thin slot walls; rotation needed because stick long axis is body-local Z, not Y
+- All dynamic bodies have `setCcdEnabled(true)` to prevent tunneling through thin walls
+- **Stick body-local long axis is Z** (not Y) — inner mesh has `rotation.x = PI/2` baked in, so body-local Z maps to world-Y when upright. Capsule collider needs `setRotation({ x: sin(PI/4), y:0, z:0, w: cos(PI/4) })`. Debug geometry needs `applyMatrix4(makeRotationX(PI/2))` to match.
+- **Don't make stick physics collider larger than visual** — oversized XZ collider clips through slot walls; widen detection radius in `updateSlotGlow` instead
+- Mallet: dynamic body with `gravityScale(0)`, high density (80), `linearDamping(2)`, `angularDamping(10)` — switches to kinematic when returning to rest (see Mallet section)
+- Sync: `body.translation()` → `mesh.position`, `body.rotation()` → `mesh.quaternion` (stones and mallet visual synced from body after `world.step()`)
 - Call `model.updateMatrixWorld(true)` before extracting triangle data for the trimesh collider
 - Pass mesh quaternion to `RigidBodyDesc.setRotation()` — otherwise body initializes with identity rotation regardless of mesh orientation
 - Restitution combine rules: table uses `CoefficientCombineRule.Max`, objects use `CoefficientCombineRule.Min` — gives table bounce without object-object bounce
 - Object-object collisions are intentionally less bouncy than object-table; don't flatten restitution globally
+- Body type switching: use `setBodyType(RigidBodyType.KinematicPositionBased)` / `setBodyType(RigidBodyType.Dynamic)` to toggle collision behavior (mallet, picked objects). Re-set `gravityScale(0)` after switching back to dynamic.
 
 ## GLB Models
 - GLB origins are often **not centered** — always wrap in a pivot `Group`, offset `raw.position.sub(center)` after computing bbox, then scale the group
@@ -110,3 +123,29 @@ assets/
 - Drop plane: `new THREE.Plane(new THREE.Vector3(0,1,0), 0)` — set `constant = -(tableTopY + 0.4)` after table loads
 - **Pick-up existing objects**: canvas `pointerdown` raycasts against `stoneBodies` meshes; hit body switches to `RigidBodyType.KinematicPositionBased`, follows drag plane on move, reverts to `Dynamic` with zeroed velocity on release
 - On `pointerdown`, immediately call `setNextKinematicTranslation` — don't wait for first `pointermove` or object stays put on static hold
+- **Drag lag**: both inventory drag and pick-up use `position.lerp(target, DRAG_LAG_FACTOR)` — same exponential chase as the mallet. `DRAG_LAG_FACTOR` (top of file) controls snappiness for both.
+- **Throw velocity**: tracked from cursor target position (not lagged position) via smoothed EMA; scaled by `THROW_SCALE` on release
+- **Interaction mode flag**: `CLICK_TOGGLE_ITEMS` (top of file) — `true` = click to grab/drop inventory items and picked objects; `false` = original hold-to-drag. Drop logic extracted into `releasePicked()` and `releaseInventoryDrag()` helpers used by both modes.
+
+## Slot Glow (`scene/scene-dev.js`)
+- `loadSlotGlow()` loads `craftingslotsfill.glb`, extracts `EdgesGeometry` from each `Slot*` mesh, creates `LineSegments2` (fat line API) in world space
+- Only meshes matching `/^slot\d+$/i` are used — other meshes in the GLB (wood_grid, Object_*) are ignored
+- Edge vertices are transformed to world space via `slotMesh.matrixWorld` and offset +0.001 Y to avoid z-fighting with the table surface
+- `updateSlotGlow()` runs each frame: fades edge line opacity in/out; also checks `RECIPES` and lerps `bloomPass.strength` for recipe match feedback
+- Glow lines are on `BLOOM_LAYER` (layer 1) for selective bloom — only they bloom, not the rest of the scene
+- Tunable constants at top of file: `SLOT_GLOW_COLOR`, `SLOT_GLOW_COLOR_RECIPE`, `SLOT_GLOW_INTENSITY`, `SLOT_FILL_RADIUS`, `SLOT_DEPTH`
+- `stoneBodies` entries store `{ mesh, body, hy, slotIndex, debugMesh }` — `hy` is spawn-time Y half-extent, used for detection
+- **Slot detection** — stones/coal: check `bottomY = t.y - hy` near `tableTopY`; sticks: find closest point on stick segment to slot center (body-local Z axis via quaternion rotation, clamped to `±hy`)
+- **Recipes**: `RECIPES` array of `{ slots: { 0-indexed-pos: itemType } }` — `slotItemType[]` tracks current item per crafting slot each frame; match triggers color + bloom change
+
+## Selective Bloom (`scene/scene-dev.js`)
+- Two-composer setup: `bloomComposer` renders only bloom-layer objects (all others darkened to black), `composer` composites bloom additively over normal render via a custom `ShaderPass`
+- `darkenNonBloom()` / `restoreMaterial()` traverse the scene each frame, swapping non-bloom materials to black for the bloom pass
+- `UnrealBloomPass` settings (strength, radius, threshold) adjustable via debug panel sliders
+- `LineMaterial` linewidth also adjustable via debug panel
+- Resize handler updates both composers and all `LineMaterial` resolutions
+
+## VFX (`scene/scene-dev.js`)
+- `spawnCraftVFX(worldPos)` — fires on mallet swing hitting the table; triggered by `malletContactPos` being set
+- Hit detection uses XZ footprint check + `headPt.y <= tableBox.max.y + 0.15` — NOT full 3D bbox containment (which misses slot hits)
+- Particle count, size, speed, gravity all tunable at top of `spawnCraftVFX`

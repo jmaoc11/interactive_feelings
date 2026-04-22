@@ -29,7 +29,7 @@
     </div>
   </div>
 
-  <div id="controls" style="display:none">
+  <div id="controls" style="display:block">
     <h2>Scene Development</h2>
     <p>Scroll Progress: <span id="progress-display">0.00</span></p>
     <input
@@ -46,6 +46,17 @@
     </div>
     <p style="margin-top:14px">Mallet Lag: <span id="lag-display">0.18</span></p>
     <input type="range" id="lag-slider" min="0.01" max="1" value="0.18" step="0.01" />
+
+    <hr style="margin:14px 0;border-color:#444" />
+    <h3 style="margin:0 0 8px">Slot Glow</h3>
+    <p>Line Width: <span id="glow-width-display">1</span></p>
+    <input type="range" id="glow-width-slider" min="0.5" max="5" value="1" step="0.1" />
+<p>Bloom Strength: <span id="bloom-strength-display">0.40</span></p>
+    <input type="range" id="bloom-strength-slider" min="0" max="3" value="0.6" step="0.05" />
+    <p>Bloom Radius: <span id="bloom-radius-display">0.25</span></p>
+    <input type="range" id="bloom-radius-slider" min="0" max="1" value="0.25" step="0.05" />
+    <p>Bloom Threshold: <span id="bloom-threshold-display">0.25</span></p>
+    <input type="range" id="bloom-threshold-slider" min="0" max="1" value="0.25" step="0.05" />
   </div>
 
 <script type="module" src="/scene/scene-dev.js"></script>

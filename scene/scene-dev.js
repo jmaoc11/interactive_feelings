@@ -1,6 +1,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import RAPIER from '@dimforge/rapier3d-compat';
 
 // Scene, camera, renderer
@@ -17,6 +25,12 @@ let dragStone = null;       // clone currently following the mouse
 let isDragging = false;
 let dragGhost = null;
 let tableTopY = 0;
+let tableBox = null;
+
+// Mallet bounce-back state
+let malletBouncing = false;
+let malletBounceTargetZ = 0;
+let malletContactPos = null;
 
 // Pick-up state (clicking existing scene stones)
 let pickedEntry = null;     // { mesh, body } being held
@@ -29,6 +43,10 @@ const pickedPosPrev = new THREE.Vector3();     // previous spring position for v
 // Pendulum hang offset
 const hangOffset = new THREE.Vector3();        // current XZ swing offset
 const hangVel = new THREE.Vector3();           // pendulum velocity
+
+// Drag lag (shared by pick-up and inventory drag) — same style as mallet
+const DRAG_LAG_FACTOR = 0.16;
+const CLICK_TOGGLE_ITEMS = true;  // true = click to grab, click again to drop; false = hold to drag
 
 // Idle rotation when holding an object
 const HELD_IDLE_ROTATION = false;              // toggle to enable slow idle spin while held
@@ -64,9 +82,11 @@ const FLICK_DIRECTION_RATIO = 0.72; // net dy must be >= 72% of total abs moveme
 const malletDragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 // Handle grip offset (fraction of full length above tip)
 const GRIP_OFFSET_FRAC = 0.25;
-const THROW_SCALE = 0.5;
+const THROW_SCALE = 0.3;
 const GRAB_STIFFNESS = 400;
 const GRAB_DAMPING = 28;
+const MALLET_STIFFNESS = 150;
+const MALLET_DAMPING = 18;
 
 // Drag plane for 3D hover positioning
 const raycaster = new THREE.Raycaster();
@@ -77,13 +97,263 @@ const loader = new GLTFLoader();
 
 // Rapier physics
 let world = null;
+let eventQueue = null;
 const stoneBodies = []; // { mesh, body }
+
+// Bloom post-processing
+let composer = null;
+let bloomComposer = null;
+let bloomPass = null;
+const BLOOM_LAYER = 1;
+const bloomLayer = new THREE.Layers();
+bloomLayer.set(BLOOM_LAYER);
+const darkMaterial = new THREE.MeshBasicMaterial({ color: 0x000000 });
+const storedMaterials = {};  // uuid → original material
+
+// Slot glow state
+const slotEdgeLines = [];       // index 0–8, top edge lines
+const slotEdgeLinesBottom = []; // index 0–8, bottom edge lines
+const slotTopPositions = [];    // index 0–8, raw top positions array for recomputing bottom
+const slotCenters = [];     // world-space center of each slot hole
+const slotFilled = [];      // boolean per slot
+const slotItemType = [];    // index 0–8, inventory slotIndex of item in slot (or -1)
+const SLOT_GLOW_COLOR = new THREE.Color(0xC8AA92);
+const SLOT_GLOW_COLOR_RECIPE = new THREE.Color(0xFFBC85);
+const SLOT_GLOW_INTENSITY = 2.5;
+const SLOT_FILL_RADIUS = 0.06;       // XZ distance threshold to count as "in slot"
+const SLOT_FILL_RADIUS_STICK = 0.11; // wider threshold for sticks (thin axis can be offset from slot center)
+const SLOT_DEPTH = 0.13;        // how far down the bottom ring sits below the top ring
+
+// Crafting recipes — slots are 1-indexed in comments, 0-indexed in code
+// Item types: 0 = stone, 1 = stick, 2 = coal
+const RECIPES = [
+  { slots: { 0: 0, 1: 0, 2: 0, 4: 1, 7: 1 } }, // stone1,stone2,stone3 + stick5,stick8
+];
+
+
+// Mallet physics
+let malletBody = null;
+let malletCollider = null;
+let malletHitFiredThisSwing = false;
+
+// ─── Craft VFX ────────────────────────────────────────────────────────────────
+const activeParticles = [];
+let vfxContainer = null;
+const VFX_COLORS = ['#FFD700', '#FFC300', '#FFFFFF', '#F5E642', '#FFA500', '#C8A96A', '#AAAAAA'];
+
+function initVFX() {
+  vfxContainer = document.createElement('div');
+  vfxContainer.style.cssText = 'position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:100;';
+  document.body.appendChild(vfxContainer);
+}
+
+function spawnCraftVFX(worldPos) {
+  if (!vfxContainer || !camera) return;
+  const projected = worldPos.clone().project(camera);
+  const sx = (projected.x * 0.5 + 0.5) * window.innerWidth;
+  const sy = (-projected.y * 0.5 + 0.5) * window.innerHeight;
+
+  const count = 21;
+  for (let i = 0; i < count; i++) {
+    const angle = (Math.PI * 2 * i / count) + (Math.random() - 0.5) * 0.1;
+    const speed = 175 + Math.random() * 275;
+    const size = 60 + Math.floor(Math.random() * 75);
+    const color = VFX_COLORS[Math.floor(Math.random() * VFX_COLORS.length)];
+    const el = document.createElement('div');
+    el.style.cssText = `position:absolute;width:${size}px;height:${size}px;background:${color};pointer-events:none;left:${sx}px;top:${sy}px;`;
+    vfxContainer.appendChild(el);
+    activeParticles.push({
+      el, x: sx, y: sy,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed * 0.7 - 180,
+      gravity: 760,
+      life: 1.0,
+      decay: 1.4 + Math.random() * 0.8,
+    });
+  }
+}
+
+function updateVFX(dt) {
+  for (let i = activeParticles.length - 1; i >= 0; i--) {
+    const p = activeParticles[i];
+    p.life -= p.decay * dt;
+    if (p.life <= 0) { p.el.remove(); activeParticles.splice(i, 1); continue; }
+    p.vy += p.gravity * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.el.style.left = p.x + 'px';
+    p.el.style.top = p.y + 'px';
+    p.el.style.opacity = Math.max(0, p.life);
+  }
+}
+
+// ─── Slot Glow ────────────────────────────────────────────────────────────────
+
+function loadSlotGlow() {
+  loader.load('/assets/Models/craftingslotsfill.glb', (gltf) => {
+    const slotsRoot = gltf.scene;
+    slotsRoot.updateMatrixWorld(true);
+
+    // Collect slot meshes sorted by name
+    const slotMeshes = [];
+    slotsRoot.traverse((child) => {
+      if (child.isMesh && /^slot\d+$/i.test(child.name)) slotMeshes.push(child);
+    });
+    slotMeshes.sort((a, b) => {
+      const numA = parseInt(a.name.replace(/\D/g, '')) || 0;
+      const numB = parseInt(b.name.replace(/\D/g, '')) || 0;
+      return numA - numB;
+    });
+
+    for (let i = 0; i < slotMeshes.length; i++) {
+      const slotMesh = slotMeshes[i];
+
+      // World-space center for fill detection
+      const box = new THREE.Box3().setFromObject(slotMesh);
+      const center = box.getCenter(new THREE.Vector3());
+      slotCenters[i] = center;
+      slotFilled[i] = false;
+
+      // Extract edges from the fill plane geometry
+      const edges = new THREE.EdgesGeometry(slotMesh.geometry, 1);
+
+      // Transform edge vertices into world space
+      const posAttr = edges.getAttribute('position');
+      const positionsTop = [];
+      const positionsBottom = [];
+      const v = new THREE.Vector3();
+      for (let j = 0; j < posAttr.count; j++) {
+        v.set(posAttr.getX(j), posAttr.getY(j), posAttr.getZ(j));
+        v.applyMatrix4(slotMesh.matrixWorld);
+        positionsTop.push(v.x, v.y + 0.001, v.z);
+        positionsBottom.push(v.x, v.y + 0.001 - SLOT_DEPTH, v.z);
+      }
+
+      function makeLineSegments(positions) {
+        const geo = new LineSegmentsGeometry();
+        geo.setPositions(positions);
+        const mat = new LineMaterial({
+          color: SLOT_GLOW_COLOR.getHex(),
+          linewidth: 2,
+          transparent: true,
+          opacity: 0,
+          depthTest: true,
+          resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
+        });
+        const ls = new LineSegments2(geo, mat);
+        ls.layers.enable(BLOOM_LAYER);
+        ls.renderOrder = 999;
+        ls.frustumCulled = false;
+        scene.add(ls);
+        return ls;
+      }
+
+      slotTopPositions[i] = positionsTop;
+      slotEdgeLines[i] = makeLineSegments(positionsTop);
+      // slotEdgeLinesBottom[i] = makeLineSegments(positionsBottom);
+    }
+    // Don't add slotsRoot to scene — we only want the edge lines, not the fill planes
+  });
+}
+
+function darkenNonBloom(obj) {
+  if (obj.isMesh || obj.isLineSegments || obj.isLineSegments2 || obj.isLine) {
+    if (!bloomLayer.test(obj.layers)) {
+      storedMaterials[obj.uuid] = obj.material;
+      obj.material = darkMaterial;
+    }
+  }
+}
+
+function restoreMaterial(obj) {
+  if (storedMaterials[obj.uuid]) {
+    obj.material = storedMaterials[obj.uuid];
+    delete storedMaterials[obj.uuid];
+  }
+}
+
+function updateSlotGlow() {
+  if (slotCenters.length === 0) return;
+
+  for (let i = 0; i < slotCenters.length; i++) {
+    const center = slotCenters[i];
+    if (!center) continue;
+
+    // Check if any stone body is resting within this slot's XZ radius
+    let filled = false;
+    let itemType = -1;
+    for (const { body, hy, slotIndex } of stoneBodies) {
+      const t = body.translation();
+      let checkX, checkY, checkZ;
+
+      if (slotIndex === 1) {
+        // Stick: find closest point on stick segment to slot center.
+        // Stick long axis = body-local Z. Rotate (0,0,1) by body quaternion.
+        const { x: qx, y: qy, z: qz, w: qw } = body.rotation();
+        const axX = 2*(qw*qy + qx*qz);
+        const axY = 2*(qy*qz - qw*qx);
+        const axZ = 1 - 2*(qx*qx + qy*qy);
+        const proj = (center.x-t.x)*axX + (center.y-t.y)*axY + (center.z-t.z)*axZ;
+        const c = Math.max(-hy, Math.min(hy, proj));
+        checkX = t.x + c*axX;
+        checkY = t.y + c*axY;
+        checkZ = t.z + c*axZ;
+      } else {
+        // Stones/coal: use bottom of body
+        checkX = t.x; checkY = t.y - hy; checkZ = t.z;
+      }
+
+      const distXZ = Math.sqrt((checkX-center.x)**2 + (checkZ-center.z)**2);
+      const fillRadius = slotIndex === 1 ? SLOT_FILL_RADIUS_STICK : SLOT_FILL_RADIUS;
+      if (distXZ < fillRadius && tableTopY > 0 && checkY >= tableTopY - 0.15 && checkY <= tableTopY + 0.15) {
+        filled = true;
+        itemType = slotIndex;
+        break;
+      }
+    }
+
+    slotFilled[i] = filled;
+    slotItemType[i] = itemType;
+  }
+
+  // Check if any recipe is fully matched
+  let recipeMatch = false;
+  for (const recipe of RECIPES) {
+    const match = Object.entries(recipe.slots).every(
+      ([pos, type]) => slotItemType[+pos] === type
+    );
+    if (match) { recipeMatch = true; break; }
+  }
+
+  const activeColor = recipeMatch ? SLOT_GLOW_COLOR_RECIPE : SLOT_GLOW_COLOR;
+
+  // Smoothly lerp bloom strength toward recipe target
+  if (bloomPass) {
+    const targetStrength = recipeMatch ? 0.55 : 0.45;
+    bloomPass.strength += (targetStrength - bloomPass.strength) * 0.05;
+  }
+
+  for (let i = 0; i < slotEdgeLines.length; i++) {
+    const line = slotEdgeLines[i];
+    if (!line) continue;
+
+    // Smoothly fade glow in/out
+    const targetOpacity = slotFilled[i] ? 1 : 0;
+    const mat = line.material;
+    mat.opacity += (targetOpacity - mat.opacity) * 0.08;
+    mat.color.set(activeColor);
+
+    const lineB = slotEdgeLinesBottom[i];
+    if (lineB) { lineB.material.opacity = mat.opacity; lineB.material.color.set(activeColor); }
+  }
+}
 
 // ─── Rapier init ──────────────────────────────────────────────────────────────
 
 async function initPhysics() {
   await RAPIER.init();
   world = new RAPIER.World({ x: 0, y: -2.5, z: 0 });
+  eventQueue = new RAPIER.EventQueue(true);
 }
 
 // ─── Scene init ───────────────────────────────────────────────────────────────
@@ -103,6 +373,52 @@ async function init() {
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+  // Selective bloom: bloom composer renders only BLOOM_LAYER objects
+  const renderPass = new RenderPass(scene, camera);
+  bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.45,   // strength
+    0.1,  // radius
+    0.1   // threshold
+  );
+
+  bloomComposer = new EffectComposer(renderer);
+  bloomComposer.renderToScreen = false;
+  bloomComposer.addPass(renderPass);
+  bloomComposer.addPass(bloomPass);
+
+  // Final composer: normal render + additive bloom overlay
+  const finalPass = new ShaderPass(
+    new THREE.ShaderMaterial({
+      uniforms: {
+        baseTexture: { value: null },
+        bloomTexture: { value: bloomComposer.renderTarget2.texture },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D baseTexture;
+        uniform sampler2D bloomTexture;
+        varying vec2 vUv;
+        void main() {
+          gl_FragColor = texture2D(baseTexture, vUv) + texture2D(bloomTexture, vUv);
+        }
+      `,
+    }),
+    'baseTexture'
+  );
+  finalPass.needsSwap = true;
+
+  composer = new EffectComposer(renderer);
+  composer.addPass(renderPass);
+  composer.addPass(finalPass);
+  composer.addPass(new OutputPass());
 
   const gridHelper = new THREE.GridHelper(10, 10, 0x444444, 0x222222);
   scene.add(gridHelper);
@@ -126,6 +442,7 @@ async function init() {
 
     const box = new THREE.Box3().setFromObject(model);
     tableTopY = box.max.y;
+    tableBox = box;
     dragPlane.constant = -(tableTopY + 0.4);
 
     const topCenter = new THREE.Vector3(
@@ -144,6 +461,7 @@ async function init() {
 
     addTablePhysics(model);
     loadMallet(box);
+    loadSlotGlow();
   });
 
   loadSlotModel(0, '/assets/Models/stone.glb', 0.16);
@@ -158,6 +476,7 @@ async function init() {
   controls.zoomSpeed = 1.2;
   controls.update();
 
+  initVFX();
   window.addEventListener('resize', onResize);
   setupControls();
   setupDrag();
@@ -197,6 +516,8 @@ function addTablePhysics(model) {
   });
 
   const tableBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+
+  // Trimesh: only collides with stones (not the mallet)
   const trimeshDesc = RAPIER.ColliderDesc
     .trimesh(new Float32Array(verts), new Uint32Array(indices))
     .setRestitution(0.3)
@@ -242,7 +563,47 @@ function loadMallet(tableBox) {
     scene.add(group);
     malletRestPosition.copy(restPos);
     malletRestRotation.copy(group.rotation);
-    malletDragPlane.constant = -(tableTopY + 0.1);
+    malletDragPlane.constant = -(tableTopY + 0.2);
+
+    // ── Mallet physics body (kinematic) ──────────────────────────────────────
+    group.updateMatrixWorld(true);
+    const fullBbox = new THREE.Box3().setFromObject(group);
+    const fSize = fullBbox.getSize(new THREE.Vector3());
+    const fCenter = fullBbox.getCenter(new THREE.Vector3());
+    // Long axis = mallet length direction
+    const fAxis = fSize.x > fSize.y
+      ? (fSize.x > fSize.z ? 'x' : 'z')
+      : (fSize.y > fSize.z ? 'y' : 'z');
+    const fHalf = fSize[fAxis] / 2;
+    const fA = fCenter.clone(); fA[fAxis] += fHalf;
+    const fB = fCenter.clone(); fB[fAxis] -= fHalf;
+    // Head = end furthest from pivot (handle tip = group world position)
+    const headWorldPos = fA.distanceTo(restPos) > fB.distanceTo(restPos) ? fA : fB;
+
+    const bodyQuat = new THREE.Quaternion().setFromEuler(group.rotation);
+    const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(restPos.x, restPos.y, restPos.z)
+      .setRotation({ x: bodyQuat.x, y: bodyQuat.y, z: bodyQuat.z, w: bodyQuat.w })
+      .setGravityScale(0)
+      .setLinearDamping(2)
+      .setAngularDamping(10);
+    malletBody = world.createRigidBody(bodyDesc);
+
+    // Collider offset = head pos in body-local space
+    const headOffset = headWorldPos.clone()
+      .sub(restPos)
+      .applyQuaternion(bodyQuat.clone().invert());
+    const crossAxes = ['x', 'y', 'z'].filter(a => a !== fAxis);
+    const headRadius = Math.max(
+      Math.min(fSize[crossAxes[0]], fSize[crossAxes[1]]) * 0.5, 0.04
+    );
+    malletCollider = world.createCollider(
+      RAPIER.ColliderDesc.ball(headRadius)
+        .setTranslation(headOffset.x, headOffset.y, headOffset.z)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+        .setDensity(80),
+      malletBody
+    );
 
     // Click to grab
     renderer.domElement.addEventListener('pointerdown', onMalletPointerDown);
@@ -250,7 +611,20 @@ function loadMallet(tableBox) {
 }
 
 function onMalletPointerDown(e) {
-  if (isDragging || pickedEntry || malletHeld || !malletGroup) return;
+  if (isDragging || pickedEntry || !malletGroup) return;
+
+  // Toggle: if already held, drop it on any canvas click
+  if (malletHeld) {
+    malletHeld = false;
+    malletReturning = true;
+    malletVelocity.set(0, 0, 0);
+    controls.enabled = true;
+    renderer.domElement.style.cursor = '';
+    if (malletBody) {
+      malletBody.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+    }
+    return;
+  }
 
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -264,6 +638,11 @@ function onMalletPointerDown(e) {
   malletHeld = true;
   malletReturning = false;
   malletSwinging = false;
+  // Switch back to dynamic so collisions work while held
+  if (malletBody) {
+    malletBody.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    malletBody.setGravityScale(0, true);
+  }
   renderer.domElement.style.cursor = 'grabbing';
   malletVelocity.set(0, 0, 0);
   malletPrevVelocity.set(0, 0, 0);
@@ -341,11 +720,20 @@ function addStonePhysics(mesh) {
     .setTranslation(x, y, z)
     .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
     .setLinearDamping(0.2)
-    .setAngularDamping(0.05);
+    .setAngularDamping(0.05)
+    .setCcdEnabled(true);
   const body = world.createRigidBody(bodyDesc);
 
-  const colliderDesc = RAPIER.ColliderDesc
-    .cuboid(hx, hy, hz)
+  const isStick = mesh.userData.slotIndex === 1;
+  // Stick's long axis is body-local Z (inner mesh has baked rotation.x=PI/2 which maps Z→Y visually,
+  // so the capsule must be rotated PI/2 around X to align with body-local Z instead of Y)
+  const stickCapsuleRot = { x: Math.sin(Math.PI / 4), y: 0, z: 0, w: Math.cos(Math.PI / 4) };
+  const capsuleHH = Math.max(0.001, hy - Math.min(hx, hz));
+  const capsuleR = Math.min(hx, hz);
+  const colliderDesc = isStick
+    ? RAPIER.ColliderDesc.capsule(capsuleHH, capsuleR).setRotation(stickCapsuleRot)
+    : RAPIER.ColliderDesc.cuboid(hx, hy, hz);
+  colliderDesc
     .setRestitution(0.05)
     .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Min)
     .setFriction(0.6);
@@ -360,7 +748,17 @@ function addStonePhysics(mesh) {
     world.createCollider(bumpDesc, body);
   }
 
-  stoneBodies.push({ mesh, body, slotIndex: mesh.userData.slotIndex });
+  let debugMesh = null;
+  if (isStick) {
+    const debugGeo = new THREE.CapsuleGeometry(capsuleR, capsuleHH * 2, 4, 8);
+    // Bake PI/2 around X into geometry so it aligns with body-local Z (matching the collider rotation)
+    debugGeo.applyMatrix4(new THREE.Matrix4().makeRotationX(Math.PI / 2));
+    const debugMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+    debugMesh = new THREE.Mesh(debugGeo, debugMat);
+    scene.add(debugMesh);
+  }
+
+  stoneBodies.push({ mesh, body, hy, slotIndex: mesh.userData.slotIndex, debugMesh });
   return body;
 }
 
@@ -436,7 +834,41 @@ function onSlotPointerDown(e) {
   moveDragGhost(e.clientX, e.clientY);
 }
 
+function releasePicked() {
+  pickedEntry.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+  const tv = pickedTargetVel;
+  pickedEntry.body.setLinvel({ x: tv.x * THROW_SCALE, y: tv.y * THROW_SCALE, z: tv.z * THROW_SCALE }, true);
+  pickedEntry.body.setAngvel({ x: tv.z * THROW_SCALE * 4, y: 0, z: -tv.x * THROW_SCALE * 4 }, true);
+  pickedEntry = null;
+  controls.enabled = true;
+  renderer.domElement.style.cursor = '';
+}
+
+function releaseInventoryDrag(clientX, clientY) {
+  isDragging = false;
+  renderer.domElement.style.cursor = '';
+  if (dragGhost) { dragGhost.remove(); dragGhost = null; }
+  if (dragStone && dragStone.visible && isOverCanvas(clientX, clientY)) {
+    const body = addStonePhysics(dragStone);
+    body.setLinvel({ x: dragStoneVel.x * THROW_SCALE, y: dragStoneVel.y * THROW_SCALE, z: dragStoneVel.z * THROW_SCALE }, true);
+  } else {
+    if (dragStone) scene.remove(dragStone);
+  }
+  dragStone = null;
+  controls.enabled = true;
+}
+
 function onCanvasPointerDown(e) {
+  // Toggle-drop for picked object
+  if (CLICK_TOGGLE_ITEMS && pickedEntry) {
+    releasePicked();
+    return;
+  }
+  // Toggle-drop for inventory drag
+  if (CLICK_TOGGLE_ITEMS && isDragging) {
+    releaseInventoryDrag(e.clientX, e.clientY);
+    return;
+  }
   if (isDragging || pickedEntry) return;
 
   const rect = renderer.domElement.getBoundingClientRect();
@@ -469,6 +901,9 @@ function onCanvasPointerDown(e) {
     pickedCurrentPos.copy(hit);
     pickedTargetPrev.copy(hit);
     pickedPosPrev.copy(hit);
+    // Teleport body directly to target (bypasses kinematic sweep, which gets blocked
+    // when the body is embedded inside the table's slot geometry, e.g. a fallen stick)
+    entry.body.setTranslation({ x: hit.x, y: hit.y, z: hit.z }, true);
     entry.body.setNextKinematicTranslation({ x: hit.x, y: hit.y, z: hit.z });
   }
   pickedTargetVel.set(0, 0, 0);
@@ -491,6 +926,7 @@ function isOverCanvas(x, y) {
 const dragStoneTargetPos = new THREE.Vector3();
 const dragStoneCurrentPos = new THREE.Vector3();
 const dragStoneVel = new THREE.Vector3();
+const dragStonePrevPos = new THREE.Vector3();
 let dragStoneInitialized = false;
 
 function positionStoneAtCursor(clientX, clientY) {
@@ -506,6 +942,7 @@ function positionStoneAtCursor(clientX, clientY) {
 
   if (!dragStoneInitialized) {
     dragStoneCurrentPos.copy(hit);
+    dragStonePrevPos.copy(hit);
     dragStoneVel.set(0, 0, 0);
     dragStoneInitialized = true;
   }
@@ -559,8 +996,11 @@ function onPointerMove(e) {
       if (isLeftFlick && netDy >= FLICK_THRESHOLD_PX) {
         malletSwinging = true;
         malletSwingT = 0;
-        malletSwingDir = 1; // always swing down
+        malletSwingDir = 1;
         malletBaseRotZ = malletGroup.rotation.z;
+        malletHitFiredThisSwing = false;
+        malletBouncing = false;
+        malletContactPos = null;
         flickWindow.length = 0;
         _prevClientY = null;
         _prevClientX = null;
@@ -611,44 +1051,15 @@ function onPointerMove(e) {
 }
 
 function onPointerUp(e) {
-  if (malletHeld && malletGroup) {
-    malletHeld = false;
-    malletReturning = true;
-    malletVelocity.set(0, 0, 0);
-    controls.enabled = true;
-    renderer.domElement.style.cursor = '';
-    return;
-  }
+  if (CLICK_TOGGLE_ITEMS) return;
 
   if (pickedEntry) {
-    pickedEntry.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
-    const tv = pickedTargetVel;
-    pickedEntry.body.setLinvel({
-      x: tv.x * THROW_SCALE, y: tv.y * THROW_SCALE, z: tv.z * THROW_SCALE
-    }, true);
-    pickedEntry.body.setAngvel({
-      x: tv.z * THROW_SCALE * 4, y: 0, z: -tv.x * THROW_SCALE * 4
-    }, true);
-    pickedEntry = null;
-    controls.enabled = true;
-    renderer.domElement.style.cursor = '';
+    releasePicked();
     return;
   }
 
   if (!isDragging) return;
-  isDragging = false;
-  renderer.domElement.style.cursor = '';
-
-  if (dragGhost) { dragGhost.remove(); dragGhost = null; }
-
-  if (dragStone && dragStone.visible && isOverCanvas(e.clientX, e.clientY)) {
-    const body = addStonePhysics(dragStone);
-    body.setLinvel({ x: dragStoneVel.x * THROW_SCALE, y: dragStoneVel.y * THROW_SCALE, z: dragStoneVel.z * THROW_SCALE }, true);
-  } else {
-    if (dragStone) scene.remove(dragStone);
-  }
-  dragStone = null;
-  controls.enabled = true;
+  releaseInventoryDrag(e.clientX, e.clientY);
 }
 
 // ─── Physics step ─────────────────────────────────────────────────────────────
@@ -657,11 +1068,8 @@ function updatePhysics() {
   if (!world) return;
 
   if (pickedEntry) {
-    // Spring toward cursor
-    const diff = pickedTargetPos.clone().sub(pickedCurrentPos);
-    pickedSpringVel.addScaledVector(diff, GRAB_STIFFNESS * lastDt);
-    pickedSpringVel.addScaledVector(pickedSpringVel, -GRAB_DAMPING * lastDt);
-    pickedCurrentPos.addScaledVector(pickedSpringVel, lastDt);
+    // Lag position toward cursor — same as mallet
+    pickedCurrentPos.lerp(pickedTargetPos, DRAG_LAG_FACTOR);
 
 
     // const xzSpeed = Math.sqrt(
@@ -681,20 +1089,74 @@ function updatePhysics() {
       w: heldIdleQuat.w
     });
 
-    // Track actual spring position velocity for throw on release
-    const posDelta = pickedCurrentPos.clone().sub(pickedPosPrev);
+    // Track cursor velocity for throw on release
+    const posDelta = pickedTargetPos.clone().sub(pickedPosPrev);
     const instantVel = posDelta.divideScalar(Math.max(lastDt, 0.001));
     pickedTargetVel.lerp(instantVel, 0.5);
-    pickedPosPrev.copy(pickedCurrentPos);
+    pickedPosPrev.copy(pickedTargetPos);
   }
 
-  world.step();
+  // Mallet physics: dynamic with spring force when held, kinematic lerp when returning
+  if (malletBody && malletGroup) {
+    if (malletHeld) {
+      const halfHeight = malletGroup.userData.halfHeight ?? 0;
+      const gripOff = halfHeight * GRIP_OFFSET_FRAC * 2;
 
-  for (const { mesh, body } of stoneBodies) {
+      const pos = malletBody.translation();
+      const vel = malletBody.linvel();
+
+      malletBody.resetForces(true);
+      malletBody.addForce({
+        x: MALLET_STIFFNESS * (malletTargetPos.x - pos.x) - MALLET_DAMPING * vel.x,
+        y: MALLET_STIFFNESS * (malletTargetPos.y - gripOff - pos.y) - MALLET_DAMPING * vel.y,
+        z: MALLET_STIFFNESS * (malletTargetPos.z - pos.z) - MALLET_DAMPING * vel.z,
+      }, true);
+
+      // Sync body rotation from visual (rotation handled by updateMallet)
+      const q = malletGroup.quaternion;
+      malletBody.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+      malletBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    } else {
+      // Kinematic return — lerp toward rest, no collisions
+      const p = malletGroup.position;
+      const q = malletGroup.quaternion;
+      malletBody.setNextKinematicTranslation({ x: p.x, y: p.y, z: p.z });
+      malletBody.setNextKinematicRotation({ x: q.x, y: q.y, z: q.z, w: q.w });
+    }
+  }
+
+  world.step(eventQueue);
+
+  // Always drain so the queue doesn't back up
+  if (eventQueue) eventQueue.drainCollisionEvents(() => {});
+
+  // Detect mallet head entering table bbox during a swing
+  if (malletCollider && malletSwinging && tableBox && !malletHitFiredThisSwing) {
+    const t = malletCollider.translation();
+    const headPt = new THREE.Vector3(t.x, t.y, t.z);
+    const inXZ = headPt.x >= tableBox.min.x - 0.06 && headPt.x <= tableBox.max.x + 0.06
+               && headPt.z >= tableBox.min.z - 0.06 && headPt.z <= tableBox.max.z + 0.06;
+    if (inXZ && headPt.y <= tableBox.max.y + 0.15) {
+      malletHitFiredThisSwing = true;
+      malletContactPos = headPt;
+    }
+  }
+
+  for (const { mesh, body, debugMesh } of stoneBodies) {
     const { x, y, z } = body.translation();
     const rot = body.rotation();
     mesh.position.set(x, y, z);
     mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+    if (debugMesh) {
+      debugMesh.position.set(x, y, z);
+      debugMesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+    }
+  }
+
+  // Sync mallet visual position from physics body
+  if (malletBody && malletGroup) {
+    const t = malletBody.translation();
+    malletGroup.position.set(t.x, t.y, t.z);
   }
 }
 
@@ -702,26 +1164,29 @@ function updatePhysics() {
 
 function updateDragStoneSpring(dt) {
   if (!isDragging || !dragStone || !dragStone.visible || !dragStoneInitialized) return;
-  const diff = dragStoneTargetPos.clone().sub(dragStoneCurrentPos);
-  dragStoneVel.addScaledVector(diff, GRAB_STIFFNESS * dt);
-  dragStoneVel.addScaledVector(dragStoneVel, -GRAB_DAMPING * dt);
-  dragStoneCurrentPos.addScaledVector(dragStoneVel, dt);
+  dragStoneCurrentPos.lerp(dragStoneTargetPos, DRAG_LAG_FACTOR);
   dragStone.position.copy(dragStoneCurrentPos);
+  // Track cursor velocity for throw on release
+  const posDelta = dragStoneTargetPos.clone().sub(dragStonePrevPos);
+  const instantVel = posDelta.divideScalar(Math.max(dt, 0.001));
+  dragStoneVel.lerp(instantVel, 0.5);
+  dragStonePrevPos.copy(dragStoneTargetPos);
   if (HELD_IDLE_ROTATION) { updateHeldIdle(dt); dragStone.quaternion.copy(heldIdleQuat); }
 }
 
 function updateMallet(dt) {
   if (!malletGroup) return;
 
-  const halfHeight = malletGroup.userData.halfHeight ?? 0;
-  // Grip offset in local space: positive Y moves the hold point up the handle
-  const gripOffset = halfHeight * GRIP_OFFSET_FRAC * 2;
-
   if (malletHeld) {
-    // Lag position toward cursor — feels like dragging a weighted object
-    malletCurrentPos.lerp(malletTargetPos, malletLagFactor);
-    malletGroup.position.copy(malletCurrentPos);
-    malletGroup.position.y -= gripOffset;
+
+    // Consume a detected table contact: stop swing, bounce back
+    if (malletContactPos) {
+      spawnCraftVFX(malletContactPos);
+      malletContactPos = null;
+      malletSwinging = false;
+      malletBouncing = true;
+      malletBounceTargetZ = malletBaseRotZ;
+    }
 
     // Apply swing animation (overrides free rotation while active)
     if (malletSwinging) {
@@ -729,12 +1194,21 @@ function updateMallet(dt) {
       if (malletSwingT >= 1) {
         malletSwingT = 1;
         malletSwinging = false;
+        malletBouncing = true;
+        malletBounceTargetZ = malletBaseRotZ;
       }
       // Ease-in-out cubic
       const ease = malletSwingT < 0.5
         ? 4 * malletSwingT * malletSwingT * malletSwingT
         : 1 - Math.pow(-2 * malletSwingT + 2, 3) / 2;
       malletGroup.rotation.z = malletBaseRotZ + malletSwingDir * SWING_ANGLE * ease;
+    } else if (malletBouncing) {
+      // Spring back to pre-swing rotation
+      malletGroup.rotation.z += (malletBounceTargetZ - malletGroup.rotation.z) * 0.18;
+      if (Math.abs(malletGroup.rotation.z - malletBounceTargetZ) < 0.01) {
+        malletGroup.rotation.z = malletBounceTargetZ;
+        malletBouncing = false;
+      }
     } else {
       // Decay tilt back toward 0 when not moving
       _malletTilt *= 0.90;
@@ -742,7 +1216,7 @@ function updateMallet(dt) {
     }
 
   } else if (malletReturning) {
-    // Lerp back to rest position and rotation
+    // Kinematic return — lerp position and rotation to rest
     malletGroup.position.lerp(malletRestPosition, 0.08);
     malletGroup.rotation.x += (malletRestRotation.x - malletGroup.rotation.x) * 0.08;
     malletGroup.rotation.y += (malletRestRotation.y - malletGroup.rotation.y) * 0.08;
@@ -769,9 +1243,10 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   lastDt = dt;
 
-  updatePhysics();
   updateMallet(dt);
+  updatePhysics();
   updateDragStoneSpring(dt);
+  updateVFX(dt);
 
   if (autoAnimate) {
     currentProgress += 0.002;
@@ -780,7 +1255,14 @@ function animate() {
   }
 
   controls.update();
-  renderer.render(scene, camera);
+  updateSlotGlow();
+
+  // Selective bloom: darken non-bloom objects, render bloom pass, restore
+  scene.traverse(darkenNonBloom);
+  bloomComposer.render();
+  scene.traverse(restoreMaterial);
+
+  composer.render();
 }
 
 function onResize() {
@@ -788,6 +1270,13 @@ function onResize() {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  if (bloomComposer) bloomComposer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) composer.setSize(window.innerWidth, window.innerHeight);
+  for (const line of slotEdgeLines) {
+    if (line && line.material.resolution) {
+      line.material.resolution.set(window.innerWidth, window.innerHeight);
+    }
+  }
 }
 
 function setupControls() {
@@ -812,6 +1301,41 @@ function setupControls() {
     autoAnimate = !autoAnimate;
     animateBtn.classList.toggle('active', autoAnimate);
     animateBtn.textContent = autoAnimate ? 'Stop Animation' : 'Auto Animate';
+  });
+
+  // Slot glow controls
+  const glowWidthSlider = document.getElementById('glow-width-slider');
+  const glowWidthDisplay = document.getElementById('glow-width-display');
+  glowWidthSlider.addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    glowWidthDisplay.textContent = val.toFixed(1);
+    for (const line of slotEdgeLines) {
+      if (line && line.material) line.material.linewidth = val;
+    }
+  });
+
+  const bloomStrengthSlider = document.getElementById('bloom-strength-slider');
+  const bloomStrengthDisplay = document.getElementById('bloom-strength-display');
+  bloomStrengthSlider.addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    bloomStrengthDisplay.textContent = val.toFixed(2);
+    if (bloomPass) bloomPass.strength = val;
+  });
+
+  const bloomRadiusSlider = document.getElementById('bloom-radius-slider');
+  const bloomRadiusDisplay = document.getElementById('bloom-radius-display');
+  bloomRadiusSlider.addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    bloomRadiusDisplay.textContent = val.toFixed(2);
+    if (bloomPass) bloomPass.radius = val;
+  });
+
+  const bloomThresholdSlider = document.getElementById('bloom-threshold-slider');
+  const bloomThresholdDisplay = document.getElementById('bloom-threshold-display');
+  bloomThresholdSlider.addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    bloomThresholdDisplay.textContent = val.toFixed(2);
+    if (bloomPass) bloomPass.threshold = val;
   });
 }
 
