@@ -10,6 +10,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import RAPIER from '@dimforge/rapier3d-compat';
+import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 // Scene, camera, renderer
 let scene, camera, renderer, controls;
@@ -104,6 +105,8 @@ const stoneBodies = []; // { mesh, body }
 let composer = null;
 let bloomComposer = null;
 let bloomPass = null;
+let bloomBaseStrength = 0.45; // controlled by debug slider
+const DEFAULT_LINE_WIDTH = 2;
 const BLOOM_LAYER = 1;
 const bloomLayer = new THREE.Layers();
 bloomLayer.set(BLOOM_LAYER);
@@ -112,8 +115,8 @@ const storedMaterials = {};  // uuid → original material
 
 // Slot glow state
 const slotEdgeLines = [];       // index 0–8, top edge lines
-const slotEdgeLinesBottom = []; // index 0–8, bottom edge lines
-const slotTopPositions = [];    // index 0–8, raw top positions array for recomputing bottom
+const slotEdgeLinesBottom = []; // index 0–8, copy of top ring offset downward by slotDepth
+const slotTopPositions = [];    // index 0–8, raw top positions for recomputing bottom ring
 const slotCenters = [];     // world-space center of each slot hole
 const slotFilled = [];      // boolean per slot
 const slotItemType = [];    // index 0–8, inventory slotIndex of item in slot (or -1)
@@ -122,13 +125,193 @@ const SLOT_GLOW_COLOR_RECIPE = new THREE.Color(0xFFBC85);
 const SLOT_GLOW_INTENSITY = 2.5;
 const SLOT_FILL_RADIUS = 0.06;       // XZ distance threshold to count as "in slot"
 const SLOT_FILL_RADIUS_STICK = 0.11; // wider threshold for sticks (thin axis can be offset from slot center)
-const SLOT_DEPTH = 0.13;        // how far down the bottom ring sits below the top ring
+const DEFAULT_SLOT_DEPTH = 0;
+let slotDepth = DEFAULT_SLOT_DEPTH;
 
 // Crafting recipes — slots are 1-indexed in comments, 0-indexed in code
 // Item types: 0 = stone, 1 = stick, 2 = coal
 const RECIPES = [
   { slots: { 0: 0, 1: 0, 2: 0, 4: 1, 7: 1 } }, // stone1,stone2,stone3 + stick5,stick8
+  { slots: { 4: 0 } },                          // stone in center slot
 ];
+
+// ─── Forge state ──────────────────────────────────────────────────────────────
+// Recipe match + hammer → fuse items into a single glowing mesh, compress each
+// subsequent hit, then hand off to onForgeComplete for the morph-to-result step.
+const FORGE_HAMMER_MIN        = 7;     // inclusive lower bound for randomized hammer total
+const FORGE_HAMMER_MAX        = 15;    // inclusive upper bound
+const FORGE_COMPRESS_Y        = 0.93;  // Y-scale multiplier per compress hit (subtle — morph is the main visual)
+const FORGE_WIDEN_XZ          = 1.015; // XZ-scale multiplier per compress hit
+const FORGE_EMISSIVE_INTENSITY = 2.0;
+const FORGE_GLOW_COLOR        = 0xFFFFFF;
+const FORGE_SCALE_LERP        = 0.18;  // per-frame lerp toward target scale
+
+let gridInner = null;
+let gridInnerOriginalMaterial = null;
+let gridFloor = null;
+let woodFloor = null;
+let forgeState = 'idle';        // 'idle' | 'forging' | 'complete'
+let forgeHammerCount = 0;
+let forgeHammerTotal = 0;        // randomized FORGE_HAMMER_MIN..MAX per forge
+let fusedMesh = null;            // single merged glowing mesh — morph source
+let fusedTargetScale = new THREE.Vector3(1, 1, 1);
+let currentRecipeMatch = false;  // set by updateSlotGlow each frame
+let currentMatchedRecipe = null; // the matched recipe object, or null
+
+// Morph state — vertex-lerp from fused blob to result shape, driven by hammer count
+const MORPH_LERP = 0.18;         // per-frame ease toward latest target progress
+let morphActive = false;
+let morphProgress = 0;           // displayed progress (0..1)
+let morphTargetProgress = 0;     // target progress, advances one step per hammer
+let morphOriginalPositions = null;
+let morphTargetPositions = null;
+
+// Result-mesh geometry — defaults to a cube. Swap via setForgeResult(geo) or pass any
+// BufferGeometry / Mesh. Morph pulls each fused-mesh vertex to its nearest point on
+// the result's surface, so any topology works (vertex counts don't need to match).
+let forgeResultGeometry = new THREE.BoxGeometry(1, 1, 1);
+export function setForgeResult(geoOrMesh) {
+  if (!geoOrMesh) return;
+  if (geoOrMesh.isMesh) {
+    const g = geoOrMesh.geometry.clone();
+    geoOrMesh.updateMatrix();
+    g.applyMatrix4(geoOrMesh.matrix);
+    forgeResultGeometry = g;
+  } else {
+    forgeResultGeometry = geoOrMesh;
+  }
+}
+
+// For each src vertex, find the nearest point on the target mesh's surface.
+// Result positions are in src-local space (so they can be assigned straight to
+// src.geometry.attributes.position) and sized to roughly match the src world bbox.
+function computeMorphTarget(srcGeo, tgtGeo, srcScale) {
+  srcGeo.computeBoundingBox();
+  const srcSize = new THREE.Vector3();
+  srcGeo.boundingBox.getSize(srcSize);
+  srcSize.multiply(srcScale);
+  const targetMaxDim = Math.max(srcSize.x, srcSize.y, srcSize.z) * 0.3;
+
+  tgtGeo.computeBoundingBox();
+  const tgtCenter = new THREE.Vector3();
+  tgtGeo.boundingBox.getCenter(tgtCenter);
+  const tgtSize = new THREE.Vector3();
+  tgtGeo.boundingBox.getSize(tgtSize);
+  const tgtMax = Math.max(tgtSize.x, tgtSize.y, tgtSize.z) || 1;
+  const tgtFit = targetMaxDim / tgtMax;
+
+  // Build target triangles in src-local space (world / srcScale, centered at origin).
+  const inv = new THREE.Vector3(1 / srcScale.x, 1 / srcScale.y, 1 / srcScale.z);
+  const remap = (out, ax, ay, az) => {
+    out.set(
+      ((ax - tgtCenter.x) * tgtFit) * inv.x,
+      ((ay - tgtCenter.y) * tgtFit) * inv.y,
+      ((az - tgtCenter.z) * tgtFit) * inv.z,
+    );
+  };
+  const tgtPos = tgtGeo.attributes.position.array;
+  const tgtIdx = tgtGeo.index ? tgtGeo.index.array : null;
+  const triCount = tgtIdx ? tgtIdx.length / 3 : tgtPos.length / 9;
+  const triangles = [];
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  for (let i = 0; i < triCount; i++) {
+    const ia = tgtIdx ? tgtIdx[i*3]     : i*3;
+    const ib = tgtIdx ? tgtIdx[i*3 + 1] : i*3 + 1;
+    const ic = tgtIdx ? tgtIdx[i*3 + 2] : i*3 + 2;
+    remap(a, tgtPos[ia*3], tgtPos[ia*3+1], tgtPos[ia*3+2]);
+    remap(b, tgtPos[ib*3], tgtPos[ib*3+1], tgtPos[ib*3+2]);
+    remap(c, tgtPos[ic*3], tgtPos[ic*3+1], tgtPos[ic*3+2]);
+    triangles.push(new THREE.Triangle(a.clone(), b.clone(), c.clone()));
+  }
+
+  const srcArr = srcGeo.attributes.position.array;
+  const out = new Float32Array(srcArr.length);
+  const v = new THREE.Vector3(), p = new THREE.Vector3(), best = new THREE.Vector3();
+  for (let i = 0; i < srcArr.length / 3; i++) {
+    v.set(srcArr[i*3], srcArr[i*3+1], srcArr[i*3+2]);
+    let bestD = Infinity;
+    for (const tri of triangles) {
+      tri.closestPointToPoint(v, p);
+      const d = v.distanceToSquared(p);
+      if (d < bestD) { bestD = d; best.copy(p); }
+    }
+    out[i*3]     = best.x;
+    out[i*3 + 1] = best.y;
+    out[i*3 + 2] = best.z;
+  }
+  return out;
+}
+
+// Fired when the final hammer lands — morph is already at 1.0 by then. Override
+// for post-forge effects (sound, particles, swap in a real pickup item, etc.).
+let onForgeComplete = (mesh) => {};
+
+let _morphDbgTick = 0;
+function updateMorph(dt) {
+  if (!morphActive || !fusedMesh || !morphTargetPositions) return;
+  morphProgress += (morphTargetProgress - morphProgress) * MORPH_LERP;
+  const arr = fusedMesh.geometry.attributes.position.array;
+  for (let i = 0; i < arr.length; i++) {
+    arr[i] = morphOriginalPositions[i] + (morphTargetPositions[i] - morphOriginalPositions[i]) * morphProgress;
+  }
+  fusedMesh.geometry.attributes.position.needsUpdate = true;
+  fusedMesh.geometry.computeBoundingSphere();
+  fusedMesh.geometry.computeVertexNormals();
+  if ((_morphDbgTick++ % 30) === 0) {
+    console.log('[morph] progress=' + morphProgress.toFixed(3)
+      + ' v0=[' + arr[0].toFixed(4) + ',' + arr[1].toFixed(4) + ',' + arr[2].toFixed(4) + ']'
+      + ' inScene=' + !!fusedMesh.parent
+      + ' visible=' + fusedMesh.visible);
+  }
+  if (forgeState === 'complete' && Math.abs(morphProgress - 1) < 0.001) morphActive = false;
+}
+
+// ─── Sphere→Cube morph smoke test ─────────────────────────────────────────────
+// Spawns a sphere above the table and morphs it into a cube over ~5s to verify
+// computeMorphTarget. Called from init after the table loads.
+let testMorphMesh = null;
+let testMorphOriginal = null;
+let testMorphTarget = null;
+let testMorphProgress = 0;
+let testMorphActive = false;
+const TEST_MORPH_DURATION = 5; // seconds
+
+function startSphereToCubeTest() {
+  if (!tableBox) return;
+  const geo = new THREE.SphereGeometry(0.2, 32, 32);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xff5599,
+    emissive: 0x441122,
+    roughness: 0.35,
+    metalness: 0.1,
+  });
+  testMorphMesh = new THREE.Mesh(geo, mat);
+  testMorphMesh.position.set(
+    (tableBox.min.x + tableBox.max.x) / 2,
+    tableTopY + 0.35,
+    (tableBox.min.z + tableBox.max.z) / 2,
+  );
+  scene.add(testMorphMesh);
+
+  const tgtGeo = new THREE.BoxGeometry(1, 1, 1);
+  testMorphOriginal = new Float32Array(geo.attributes.position.array);
+  testMorphTarget = computeMorphTarget(geo, tgtGeo, testMorphMesh.scale);
+  testMorphProgress = 0;
+  testMorphActive = true;
+}
+
+function updateSphereToCubeTest(dt) {
+  if (!testMorphActive || !testMorphMesh) return;
+  testMorphProgress = Math.min(testMorphProgress + dt / TEST_MORPH_DURATION, 1);
+  const arr = testMorphMesh.geometry.attributes.position.array;
+  for (let i = 0; i < arr.length; i++) {
+    arr[i] = testMorphOriginal[i] + (testMorphTarget[i] - testMorphOriginal[i]) * testMorphProgress;
+  }
+  testMorphMesh.geometry.attributes.position.needsUpdate = true;
+  testMorphMesh.geometry.computeVertexNormals();
+  testMorphMesh.geometry.computeBoundingSphere();
+  if (testMorphProgress >= 1) testMorphActive = false;
+}
 
 
 // Mallet physics
@@ -137,9 +320,28 @@ let malletCollider = null;
 let malletHitFiredThisSwing = false;
 
 // ─── Craft VFX ────────────────────────────────────────────────────────────────
+const USE_3D_VFX = true; // true = 3D blocky sparks with bloom; false = 2D CSS overlay
+
+// 2D CSS particles
 const activeParticles = [];
 let vfxContainer = null;
 const VFX_COLORS = ['#FFD700', '#FFC300', '#FFFFFF', '#F5E642', '#FFA500', '#C8A96A', '#AAAAAA'];
+
+// 3D spark particles
+const active3DParticles = [];
+const SPARK_COLORS_3D = [0xFFFFFF, 0xFFEE44, 0xFFAA00, 0xFF6600, 0xFFDD00, 0xFFCC33];
+const sparkGeo = new THREE.BoxGeometry(0.012, 0.012, 0.012);
+const SPARK_TRAIL_LENGTH = 6;
+
+// Mutable VFX params — driven by debug panel sliders
+let vfxCount        = 45;
+let vfxSpeedMin     = 1.5,  vfxSpeedMax    = 2.5;
+let vfxConeMin      = 1.2,  vfxConeMax     = 1.7;
+let vfxDecayMin     = 1.6,  vfxDecayMax    = 2.5;
+let vfxGravity      = -7;
+let vfxUpKick       = 0.4;
+let vfxSizeMin      = 0.9,  vfxSizeMax     = 1.6;
+let vfxTrailOpacity = 0.5;
 
 function initVFX() {
   vfxContainer = document.createElement('div');
@@ -187,10 +389,145 @@ function updateVFX(dt) {
   }
 }
 
+function spawn3DVfx(worldPos) {
+  if (!scene) return;
+  const coneAngle = vfxConeMin + Math.random() * (vfxConeMax - vfxConeMin);
+
+  for (let i = 0; i < vfxCount; i++) {
+    const color = SPARK_COLORS_3D[Math.floor(Math.random() * SPARK_COLORS_3D.length)];
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 });
+    const mesh = new THREE.Mesh(sparkGeo, mat);
+    mesh.scale.setScalar(vfxSizeMin + Math.random() * (vfxSizeMax - vfxSizeMin));
+    mesh.layers.enable(BLOOM_LAYER);
+    mesh.position.copy(worldPos);
+    mesh.position.x += (Math.random() - 0.5) * 0.03;
+    mesh.position.z += (Math.random() - 0.5) * 0.03;
+    scene.add(mesh);
+
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.random() * coneAngle;
+    const speed = vfxSpeedMin + Math.random() * (vfxSpeedMax - vfxSpeedMin);
+
+    const trailBuf = new Float32Array(SPARK_TRAIL_LENGTH * 3);
+    for (let t = 0; t < SPARK_TRAIL_LENGTH; t++) {
+      trailBuf[t * 3]     = worldPos.x;
+      trailBuf[t * 3 + 1] = worldPos.y;
+      trailBuf[t * 3 + 2] = worldPos.z;
+    }
+    const trailGeo = new THREE.BufferGeometry();
+    trailGeo.setAttribute('position', new THREE.BufferAttribute(trailBuf, 3));
+    trailGeo.setDrawRange(0, 1);
+    const trailMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: vfxTrailOpacity });
+    const trail = new THREE.Line(trailGeo, trailMat);
+    trail.layers.enable(BLOOM_LAYER);
+    trail.frustumCulled = false;
+    scene.add(trail);
+
+    active3DParticles.push({
+      mesh, mat,
+      trail, trailMat, trailBuf, trailCount: 0,
+      vx: Math.sin(phi) * Math.cos(theta) * speed,
+      vy: Math.cos(phi) * speed + vfxUpKick,
+      vz: Math.sin(phi) * Math.sin(theta) * speed,
+      life: 1.0,
+      decay: vfxDecayMin + Math.random() * (vfxDecayMax - vfxDecayMin),
+    });
+  }
+}
+
+function update3DVfx(dt) {
+  const gravity = vfxGravity;
+  for (let i = active3DParticles.length - 1; i >= 0; i--) {
+    const p = active3DParticles[i];
+    p.life -= p.decay * dt;
+    if (p.life <= 0) {
+      scene.remove(p.mesh);
+      scene.remove(p.trail);
+      p.mat.dispose();
+      p.trailMat.dispose();
+      p.trail.geometry.dispose();
+      active3DParticles.splice(i, 1);
+      continue;
+    }
+    p.vy += gravity * dt;
+    p.mesh.position.x += p.vx * dt;
+    p.mesh.position.y += p.vy * dt;
+    p.mesh.position.z += p.vz * dt;
+    p.mat.opacity = Math.max(0, p.life);
+
+    // Shift trail positions back, write current pos at index 0
+    const tb = p.trailBuf;
+    for (let j = Math.min(p.trailCount, SPARK_TRAIL_LENGTH - 1); j > 0; j--) {
+      tb[j * 3]     = tb[(j - 1) * 3];
+      tb[j * 3 + 1] = tb[(j - 1) * 3 + 1];
+      tb[j * 3 + 2] = tb[(j - 1) * 3 + 2];
+    }
+    tb[0] = p.mesh.position.x;
+    tb[1] = p.mesh.position.y;
+    tb[2] = p.mesh.position.z;
+    p.trailCount = Math.min(p.trailCount + 1, SPARK_TRAIL_LENGTH);
+    p.trail.geometry.setDrawRange(0, p.trailCount);
+    p.trail.geometry.attributes.position.needsUpdate = true;
+    p.trailMat.opacity = p.life * vfxTrailOpacity;
+  }
+}
+
 // ─── Slot Glow ────────────────────────────────────────────────────────────────
 
+function createSlotLine(positions, depthTest = true) {
+  const geo = new LineSegmentsGeometry();
+  geo.setPositions(positions);
+  const mat = new LineMaterial({
+    color: SLOT_GLOW_COLOR.getHex(),
+    linewidth: DEFAULT_LINE_WIDTH,
+    transparent: true,
+    opacity: 0,
+    depthTest,
+    resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
+  });
+  const ls = new LineSegments2(geo, mat);
+  ls.layers.enable(BLOOM_LAYER);
+  ls.renderOrder = 999;
+  ls.frustumCulled = false;
+  scene.add(ls);
+  return ls;
+}
+
+function createSlotWall(positionsTop, depth) {
+  // Build quad mesh: one rectangle per edge segment going straight down
+  const verts = [];
+  const indices = [];
+  let vi = 0;
+  for (let j = 0; j < positionsTop.length; j += 6) {
+    const ax = positionsTop[j],   ay = positionsTop[j+1], az = positionsTop[j+2];
+    const bx = positionsTop[j+3], by = positionsTop[j+4], bz = positionsTop[j+5];
+    verts.push(ax, ay, az,  bx, by, bz,  bx, by - depth, bz,  ax, ay - depth, az);
+    indices.push(vi, vi+1, vi+2,  vi, vi+2, vi+3);
+    vi += 4;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setIndex(indices);
+  const mat = new THREE.MeshBasicMaterial({
+    color: SLOT_GLOW_COLOR.getHex(),
+    transparent: true,
+    opacity: 0,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.layers.enable(BLOOM_LAYER);
+  mesh.renderOrder = 999;
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+  return mesh;
+}
+
 function loadSlotGlow() {
-  loader.load('/assets/Models/craftingslotsfill.glb', (gltf) => {
+  loader.load('/assets/Models/craftingGrid.glb', (gltf) => {
     const slotsRoot = gltf.scene;
     slotsRoot.updateMatrixWorld(true);
 
@@ -220,40 +557,31 @@ function loadSlotGlow() {
       // Transform edge vertices into world space
       const posAttr = edges.getAttribute('position');
       const positionsTop = [];
-      const positionsBottom = [];
       const v = new THREE.Vector3();
       for (let j = 0; j < posAttr.count; j++) {
         v.set(posAttr.getX(j), posAttr.getY(j), posAttr.getZ(j));
         v.applyMatrix4(slotMesh.matrixWorld);
         positionsTop.push(v.x, v.y + 0.001, v.z);
-        positionsBottom.push(v.x, v.y + 0.001 - SLOT_DEPTH, v.z);
-      }
-
-      function makeLineSegments(positions) {
-        const geo = new LineSegmentsGeometry();
-        geo.setPositions(positions);
-        const mat = new LineMaterial({
-          color: SLOT_GLOW_COLOR.getHex(),
-          linewidth: 2,
-          transparent: true,
-          opacity: 0,
-          depthTest: true,
-          resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
-        });
-        const ls = new LineSegments2(geo, mat);
-        ls.layers.enable(BLOOM_LAYER);
-        ls.renderOrder = 999;
-        ls.frustumCulled = false;
-        scene.add(ls);
-        return ls;
       }
 
       slotTopPositions[i] = positionsTop;
-      slotEdgeLines[i] = makeLineSegments(positionsTop);
-      // slotEdgeLinesBottom[i] = makeLineSegments(positionsBottom);
+      slotEdgeLines[i] = createSlotLine(positionsTop);
+      slotEdgeLinesBottom[i] = createSlotWall(positionsTop, slotDepth);
     }
     // Don't add slotsRoot to scene — we only want the edge lines, not the fill planes
   });
+}
+
+function updateSlotDepth(depth) {
+  slotDepth = depth;
+  for (let i = 0; i < slotTopPositions.length; i++) {
+    if (!slotTopPositions[i] || !slotCenters[i]) continue;
+    const old = slotEdgeLinesBottom[i];
+    if (old) { old.geometry.dispose(); old.material.dispose(); scene.remove(old); }
+    const wall = createSlotWall(slotTopPositions[i], depth);
+    wall.material.opacity = slotEdgeLines[i] ? slotEdgeLines[i].material.opacity : 0;
+    slotEdgeLinesBottom[i] = wall;
+  }
 }
 
 function darkenNonBloom(obj) {
@@ -318,18 +646,25 @@ function updateSlotGlow() {
 
   // Check if any recipe is fully matched
   let recipeMatch = false;
+  let matchedRecipe = null;
   for (const recipe of RECIPES) {
-    const match = Object.entries(recipe.slots).every(
+    const filled = Object.entries(recipe.slots).every(
       ([pos, type]) => slotItemType[+pos] === type
     );
-    if (match) { recipeMatch = true; break; }
+    if (!filled) continue;
+    // Other slots must be empty
+    const recipeSlots = new Set(Object.keys(recipe.slots).map(Number));
+    const othersEmpty = slotItemType.every((t, i) => recipeSlots.has(i) || t === -1);
+    if (othersEmpty) { recipeMatch = true; matchedRecipe = recipe; break; }
   }
+  currentRecipeMatch = recipeMatch;
+  currentMatchedRecipe = matchedRecipe;
 
   const activeColor = recipeMatch ? SLOT_GLOW_COLOR_RECIPE : SLOT_GLOW_COLOR;
 
-  // Smoothly lerp bloom strength toward recipe target
+  // Smoothly lerp bloom strength toward recipe target (offset from user-set base)
   if (bloomPass) {
-    const targetStrength = recipeMatch ? 0.55 : 0.45;
+    const targetStrength = recipeMatch ? bloomBaseStrength + 0.1 : bloomBaseStrength;
     bloomPass.strength += (targetStrength - bloomPass.strength) * 0.05;
   }
 
@@ -346,6 +681,172 @@ function updateSlotGlow() {
     const lineB = slotEdgeLinesBottom[i];
     if (lineB) { lineB.material.opacity = mat.opacity; lineB.material.color.set(activeColor); }
   }
+}
+
+// ─── Forge (recipe-match hammer fusion) ───────────────────────────────────────
+
+// Find stoneBodies entries whose item type matches each recipe slot.
+function collectForgeItems(recipe) {
+  const items = [];
+  for (const [posStr, type] of Object.entries(recipe.slots)) {
+    const pos = +posStr;
+    const center = slotCenters[pos];
+    if (!center) continue;
+    // Pick the closest matching body to the slot center (in XZ).
+    let best = null, bestD = Infinity;
+    for (const entry of stoneBodies) {
+      if (entry.slotIndex !== type) continue;
+      const t = entry.body.translation();
+      const d = (t.x - center.x) ** 2 + (t.z - center.z) ** 2;
+      if (d < bestD) { bestD = d; best = entry; }
+    }
+    if (best && !items.includes(best)) items.push(best);
+  }
+  return items;
+}
+
+function buildFusedMesh(meshList, centerOverride = null) {
+  // Each entry may be a Group (pivot wrapper) — collect every leaf Mesh inside.
+  const leafMeshes = [];
+  for (const m of meshList) {
+    m.updateWorldMatrix(true, false);
+    m.traverse((c) => { if (c.isMesh && c.geometry) leafMeshes.push(c); });
+  }
+  console.log('[fuse] inputs:', meshList.length, 'leafMeshes:', leafMeshes.map((c) => c.name || '(unnamed)'));
+  if (leafMeshes.length === 0) return null;
+
+  const center = new THREE.Vector3();
+  if (centerOverride) {
+    center.copy(centerOverride);
+  } else {
+    for (const m of leafMeshes) center.add(m.getWorldPosition(new THREE.Vector3()));
+    center.divideScalar(leafMeshes.length);
+  }
+
+  const geos = leafMeshes.map((m) => {
+    m.updateWorldMatrix(true, false);
+    const g = m.geometry.clone();
+    // Strip non-position attributes so geos with different layouts can merge.
+    for (const name of Object.keys(g.attributes)) {
+      if (name !== 'position') g.deleteAttribute(name);
+    }
+    g.applyMatrix4(m.matrixWorld);
+    g.translate(-center.x, -center.y, -center.z);
+    return g;
+  });
+
+  const merged = BufferGeometryUtils.mergeGeometries(geos, false);
+  const mat = new THREE.MeshStandardMaterial({
+    color: FORGE_GLOW_COLOR,
+    emissive: FORGE_GLOW_COLOR,
+    emissiveIntensity: FORGE_EMISSIVE_INTENSITY,
+  });
+  const mesh = new THREE.Mesh(merged, mat);
+  mesh.position.copy(center);
+  mesh.layers.enable(BLOOM_LAYER);
+  return mesh;
+}
+
+function startForge(recipe) {
+  const items = collectForgeItems(recipe);
+  if (items.length === 0) return;
+
+  // Fuse converges at the center slot (slot 4), which sits at the middle of the grid.
+  const fuseCenter = slotCenters[4] ? slotCenters[4].clone() : null;
+
+  // Merge Grid_Inner into the fused mesh alongside the dropped items, then detach
+  // Grid_Inner from the table so the original isn't visible underneath.
+  const meshList = items.map((it) => it.mesh);
+  if (gridInner) meshList.push(gridInner);
+
+  fusedMesh = buildFusedMesh(meshList, fuseCenter);
+  if (!fusedMesh) return;
+  scene.add(fusedMesh);
+
+  // Tear down the originals — meshes, bodies, and tracking entries.
+  for (const entry of items) {
+    if (entry.mesh.parent) entry.mesh.parent.remove(entry.mesh);
+    if (entry.body) world.removeRigidBody(entry.body);
+    const idx = stoneBodies.indexOf(entry);
+    if (idx !== -1) stoneBodies.splice(idx, 1);
+  }
+
+  // Detach Grid_Inner from the table model — its geometry is now part of fusedMesh.
+  if (gridInner && gridInner.parent) {
+    gridInnerOriginalMaterial = gridInner.material;
+    gridInner.parent.remove(gridInner);
+  }
+
+  // Hide Grid_Floor; reveal Wood_Floor as the bright glowing replacement.
+  console.log('[forge] gridFloor=', gridFloor?.name, 'woodFloor=', woodFloor?.name, 'woodFloor.visible(before)=', woodFloor?.visible);
+  if (gridFloor) gridFloor.visible = false;
+  if (woodFloor) woodFloor.visible = true;
+
+  fusedTargetScale.set(1, 1, 1);
+  forgeHammerCount = 1;
+  forgeHammerTotal = FORGE_HAMMER_MIN + Math.floor(Math.random() * (FORGE_HAMMER_MAX - FORGE_HAMMER_MIN + 1));
+  forgeState = 'forging';
+
+  // Snapshot current vertex positions as morph source; target positions are the
+  // nearest points on forgeResultGeometry. Each hammer hit advances morphTargetProgress.
+  morphOriginalPositions = new Float32Array(fusedMesh.geometry.attributes.position.array);
+  morphTargetPositions = computeMorphTarget(fusedMesh.geometry, forgeResultGeometry, fusedMesh.scale);
+  morphProgress = 0;
+  morphTargetProgress = 0;
+  morphActive = true;
+}
+
+function compressForge() {
+  if (!fusedMesh) return;
+  fusedTargetScale.x *= FORGE_WIDEN_XZ;
+  fusedTargetScale.z *= FORGE_WIDEN_XZ;
+  fusedTargetScale.y *= FORGE_COMPRESS_Y;
+  // Punch: snap current scale slightly past target so it visibly recoils each hit.
+  fusedMesh.scale.y *= FORGE_COMPRESS_Y * 0.85;
+  forgeHammerCount += 1;
+
+  // Advance morph one step. Steps span hits 2..total → morph 0 → 1.
+  const denom = Math.max(forgeHammerTotal - 1, 1);
+  morphTargetProgress = Math.min((forgeHammerCount - 1) / denom, 1);
+
+  if (forgeHammerCount >= forgeHammerTotal) {
+    morphTargetProgress = 1;
+    forgeState = 'complete';
+    onForgeComplete(fusedMesh);
+  }
+}
+
+function handleForgeHammer() {
+  console.log('[forge] hammer', { state: forgeState, recipeMatch: currentRecipeMatch, count: forgeHammerCount, total: forgeHammerTotal });
+  if (forgeState === 'idle') {
+    if (currentRecipeMatch && currentMatchedRecipe) {
+      startForge(currentMatchedRecipe);
+      console.log('[forge] startForge total=' + forgeHammerTotal + ' verts=' + (morphOriginalPositions.length / 3)
+        + ' scale=' + fusedMesh.scale.toArray().map(v => v.toFixed(3)).join(',')
+        + ' pos=' + fusedMesh.position.toArray().map(v => v.toFixed(3)).join(','));
+      const samples = [0, 100, 200, 300].filter(i => i < morphOriginalPositions.length / 3);
+      for (const i of samples) {
+        const o = `${morphOriginalPositions[i*3].toFixed(4)},${morphOriginalPositions[i*3+1].toFixed(4)},${morphOriginalPositions[i*3+2].toFixed(4)}`;
+        const t = `${morphTargetPositions[i*3].toFixed(4)},${morphTargetPositions[i*3+1].toFixed(4)},${morphTargetPositions[i*3+2].toFixed(4)}`;
+        const dx = morphTargetPositions[i*3] - morphOriginalPositions[i*3];
+        const dy = morphTargetPositions[i*3+1] - morphOriginalPositions[i*3+1];
+        const dz = morphTargetPositions[i*3+2] - morphOriginalPositions[i*3+2];
+        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        console.log(`  v${i}: orig=[${o}]  tgt=[${t}]  dist=${dist.toFixed(4)}`);
+      }
+    }
+  } else if (forgeState === 'forging') {
+    compressForge();
+    console.log('[forge] compress', { count: forgeHammerCount, progress: morphTargetProgress.toFixed(3), morphProgress: morphProgress.toFixed(3), scale: fusedMesh?.scale.toArray() });
+  }
+}
+
+function updateForge(dt) {
+  if (!fusedMesh) return;
+  if (forgeState === 'forging') {
+    fusedMesh.scale.lerp(fusedTargetScale, FORGE_SCALE_LERP);
+  }
+  updateMorph(dt);
 }
 
 // ─── Rapier init ──────────────────────────────────────────────────────────────
@@ -432,8 +933,14 @@ async function init() {
   scene.add(directionalLight);
 
   // Load crafting table
-  loader.load('/assets/Models/craftingtable.glb', (gltf) => {
+  loader.load('/assets/Models/craftingGrid.glb', (gltf) => {
     const model = gltf.scene;
+    model.traverse((child) => {
+      if (child.name === 'Wood_Floor' || /^slot\d+$/i.test(child.name)) child.visible = false;
+      if (child.isMesh && child.name === 'Grid_Inner') gridInner = child;
+      if (child.isMesh && child.name === 'Grid_Floor') gridFloor = child;
+      if (child.isMesh && child.name === 'Wood_Floor') woodFloor = child;
+    });
     scene.add(model);
     objects.push(model);
 
@@ -496,6 +1003,7 @@ function addTablePhysics(model) {
 
   model.traverse((child) => {
     if (!child.isMesh) return;
+    if (child.name === 'Wood_Floor' || /^slot\d+$/i.test(child.name)) return;
     child.updateWorldMatrix(true, false);
     const geo = child.geometry;
     const pos = geo.getAttribute('position');
@@ -748,17 +1256,7 @@ function addStonePhysics(mesh) {
     world.createCollider(bumpDesc, body);
   }
 
-  let debugMesh = null;
-  if (isStick) {
-    const debugGeo = new THREE.CapsuleGeometry(capsuleR, capsuleHH * 2, 4, 8);
-    // Bake PI/2 around X into geometry so it aligns with body-local Z (matching the collider rotation)
-    debugGeo.applyMatrix4(new THREE.Matrix4().makeRotationX(Math.PI / 2));
-    const debugMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
-    debugMesh = new THREE.Mesh(debugGeo, debugMat);
-    scene.add(debugMesh);
-  }
-
-  stoneBodies.push({ mesh, body, hy, slotIndex: mesh.userData.slotIndex, debugMesh });
+  stoneBodies.push({ mesh, body, hy, slotIndex: mesh.userData.slotIndex });
   return body;
 }
 
@@ -1138,19 +1636,24 @@ function updatePhysics() {
                && headPt.z >= tableBox.min.z - 0.06 && headPt.z <= tableBox.max.z + 0.06;
     if (inXZ && headPt.y <= tableBox.max.y + 0.15) {
       malletHitFiredThisSwing = true;
-      malletContactPos = headPt;
+      // Offset from raised rim toward face center: mallet local +Y (handle→head) projected onto XZ,
+      // negated to step back from the leading edge to the flat striking face
+      const faceNormal = new THREE.Vector3(0, 1, 0).applyQuaternion(malletGroup.quaternion);
+      faceNormal.y = 0;
+      if (faceNormal.length() > 0.001) faceNormal.normalize();
+      malletContactPos = new THREE.Vector3(
+        headPt.x - faceNormal.x * 0.12,
+        tableBox.max.y,
+        headPt.z - faceNormal.z * 0.12
+      );
     }
   }
 
-  for (const { mesh, body, debugMesh } of stoneBodies) {
+  for (const { mesh, body } of stoneBodies) {
     const { x, y, z } = body.translation();
     const rot = body.rotation();
     mesh.position.set(x, y, z);
     mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
-    if (debugMesh) {
-      debugMesh.position.set(x, y, z);
-      debugMesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
-    }
   }
 
   // Sync mallet visual position from physics body
@@ -1181,7 +1684,8 @@ function updateMallet(dt) {
 
     // Consume a detected table contact: stop swing, bounce back
     if (malletContactPos) {
-      spawnCraftVFX(malletContactPos);
+      if (USE_3D_VFX) spawn3DVfx(malletContactPos); else spawnCraftVFX(malletContactPos);
+      handleForgeHammer();
       malletContactPos = null;
       malletSwinging = false;
       malletBouncing = true;
@@ -1247,6 +1751,9 @@ function animate() {
   updatePhysics();
   updateDragStoneSpring(dt);
   updateVFX(dt);
+  update3DVfx(dt);
+  updateForge(dt);
+  updateSphereToCubeTest(dt);
 
   if (autoAnimate) {
     currentProgress += 0.002;
@@ -1272,7 +1779,7 @@ function onResize() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   if (bloomComposer) bloomComposer.setSize(window.innerWidth, window.innerHeight);
   if (composer) composer.setSize(window.innerWidth, window.innerHeight);
-  for (const line of slotEdgeLines) {
+  for (const line of [...slotEdgeLines, ...slotEdgeLinesBottom]) {
     if (line && line.material.resolution) {
       line.material.resolution.set(window.innerWidth, window.innerHeight);
     }
@@ -1283,6 +1790,14 @@ function setupControls() {
   const slider = document.getElementById('progress-slider');
   const resetBtn = document.getElementById('reset-btn');
   const animateBtn = document.getElementById('animate-btn');
+
+  // "," key toggles the debug panel
+  const debugPanel = document.getElementById('controls');
+  window.addEventListener('keydown', (e) => {
+    if (e.key === ',' && !e.target.matches('input, textarea, select')) {
+      debugPanel.classList.toggle('hidden');
+    }
+  });
 
   slider.addEventListener('input', (e) => {
     updateScene(parseFloat(e.target.value) / 100);
@@ -1306,24 +1821,43 @@ function setupControls() {
   // Slot glow controls
   const glowWidthSlider = document.getElementById('glow-width-slider');
   const glowWidthDisplay = document.getElementById('glow-width-display');
+  glowWidthSlider.value = DEFAULT_LINE_WIDTH;
+  glowWidthDisplay.textContent = DEFAULT_LINE_WIDTH.toFixed(1);
   glowWidthSlider.addEventListener('input', (e) => {
     const val = parseFloat(e.target.value);
     glowWidthDisplay.textContent = val.toFixed(1);
-    for (const line of slotEdgeLines) {
+    for (const line of [...slotEdgeLines, ...slotEdgeLinesBottom]) {
       if (line && line.material) line.material.linewidth = val;
     }
   });
 
+  const glowDepthSlider = document.getElementById('glow-depth-slider');
+  const glowDepthDisplay = document.getElementById('glow-depth-display');
+  glowDepthSlider.value = DEFAULT_SLOT_DEPTH;
+  glowDepthDisplay.textContent = DEFAULT_SLOT_DEPTH.toFixed(2);
+  glowDepthSlider.addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    glowDepthDisplay.textContent = val.toFixed(2);
+    updateSlotDepth(val);
+  });
+
   const bloomStrengthSlider = document.getElementById('bloom-strength-slider');
   const bloomStrengthDisplay = document.getElementById('bloom-strength-display');
+  bloomStrengthSlider.value = bloomBaseStrength;
+  bloomStrengthDisplay.textContent = bloomBaseStrength.toFixed(2);
   bloomStrengthSlider.addEventListener('input', (e) => {
     const val = parseFloat(e.target.value);
     bloomStrengthDisplay.textContent = val.toFixed(2);
+    bloomBaseStrength = val;
     if (bloomPass) bloomPass.strength = val;
   });
 
   const bloomRadiusSlider = document.getElementById('bloom-radius-slider');
   const bloomRadiusDisplay = document.getElementById('bloom-radius-display');
+  if (bloomPass) {
+    bloomRadiusSlider.value = bloomPass.radius;
+    bloomRadiusDisplay.textContent = bloomPass.radius.toFixed(2);
+  }
   bloomRadiusSlider.addEventListener('input', (e) => {
     const val = parseFloat(e.target.value);
     bloomRadiusDisplay.textContent = val.toFixed(2);
@@ -1332,11 +1866,82 @@ function setupControls() {
 
   const bloomThresholdSlider = document.getElementById('bloom-threshold-slider');
   const bloomThresholdDisplay = document.getElementById('bloom-threshold-display');
+  if (bloomPass) {
+    bloomThresholdSlider.value = bloomPass.threshold;
+    bloomThresholdDisplay.textContent = bloomPass.threshold.toFixed(2);
+  }
   bloomThresholdSlider.addEventListener('input', (e) => {
     const val = parseFloat(e.target.value);
     bloomThresholdDisplay.textContent = val.toFixed(2);
     if (bloomPass) bloomPass.threshold = val;
   });
+
+  // ── Tab switching ──
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+      btn.classList.add('active');
+      document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
+    });
+  });
+
+  // ── Sparks panel (built in JS) ──
+  function makeSlider(label, min, max, step, value, onChange) {
+    const wrap = document.createElement('div');
+    wrap.className = 'debug-row';
+    const decimals = step < 0.1 ? 2 : step < 1 ? 1 : 0;
+    const valSpan = document.createElement('span');
+    valSpan.className = 'debug-val';
+    valSpan.textContent = value.toFixed(decimals);
+    const p = document.createElement('p');
+    p.textContent = label + ': ';
+    p.appendChild(valSpan);
+    const input = document.createElement('input');
+    Object.assign(input, { type: 'range', min, max, step, value });
+    input.style.width = '100%';
+    input.addEventListener('input', e => {
+      const v = parseFloat(e.target.value);
+      valSpan.textContent = v.toFixed(decimals);
+      onChange(v);
+    });
+    wrap.appendChild(p);
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  function makeSectionHead(text) {
+    const h = document.createElement('h4');
+    h.className = 'debug-section';
+    h.textContent = text;
+    return h;
+  }
+
+  const sparksPanel = document.getElementById('tab-sparks');
+  const defs = [
+    { section: 'Burst' },
+    { label: 'Count',      min: 5,   max: 120, step: 1,    get: () => vfxCount,        set: v => vfxCount = v },
+    { label: 'Cone Min',   min: 0,   max: 2,   step: 0.05, get: () => vfxConeMin,      set: v => vfxConeMin = v },
+    { label: 'Cone Max',   min: 0,   max: 2,   step: 0.05, get: () => vfxConeMax,      set: v => vfxConeMax = v },
+    { label: 'Up Kick',    min: 0,   max: 3,   step: 0.05, get: () => vfxUpKick,       set: v => vfxUpKick = v },
+    { section: 'Speed' },
+    { label: 'Speed Min',  min: 0,   max: 5,   step: 0.1,  get: () => vfxSpeedMin,     set: v => vfxSpeedMin = v },
+    { label: 'Speed Max',  min: 0,   max: 5,   step: 0.1,  get: () => vfxSpeedMax,     set: v => vfxSpeedMax = v },
+    { section: 'Lifetime' },
+    { label: 'Decay Min',  min: 0.2, max: 6,   step: 0.1,  get: () => vfxDecayMin,     set: v => vfxDecayMin = v },
+    { label: 'Decay Max',  min: 0.2, max: 6,   step: 0.1,  get: () => vfxDecayMax,     set: v => vfxDecayMax = v },
+    { section: 'Physics' },
+    { label: 'Gravity',    min: -20, max: 0,   step: 0.5,  get: () => vfxGravity,      set: v => vfxGravity = v },
+    { section: 'Particles' },
+    { label: 'Size Min',   min: 0.1, max: 3,   step: 0.05, get: () => vfxSizeMin,      set: v => vfxSizeMin = v },
+    { label: 'Size Max',   min: 0.1, max: 3,   step: 0.05, get: () => vfxSizeMax,      set: v => vfxSizeMax = v },
+    { label: 'Trail Opacity', min: 0, max: 1,  step: 0.05, get: () => vfxTrailOpacity, set: v => vfxTrailOpacity = v },
+  ];
+
+  for (const d of defs) {
+    if (d.section) { sparksPanel.appendChild(makeSectionHead(d.section)); continue; }
+    sparksPanel.appendChild(makeSlider(d.label, d.min, d.max, d.step, d.get(), d.set));
+  }
 }
 
 // ─── Inventory slot API ───────────────────────────────────────────────────────

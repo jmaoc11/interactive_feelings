@@ -29,34 +29,41 @@
     </div>
   </div>
 
-  <div id="controls" style="display:block">
-    <h2>Scene Development</h2>
-    <p>Scroll Progress: <span id="progress-display">0.00</span></p>
-    <input
-      type="range"
-      id="progress-slider"
-      min="0"
-      max="100"
-      value="0"
-      step="0.1"
-    />
-    <div class="button-group">
-      <button id="reset-btn">Reset</button>
-      <button id="animate-btn">Auto Animate</button>
+  <div id="controls" class="hidden">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="scene">Scene</button>
+      <button class="tab-btn" data-tab="bloom">Bloom</button>
+      <button class="tab-btn" data-tab="sparks">Sparks</button>
     </div>
-    <p style="margin-top:14px">Mallet Lag: <span id="lag-display">0.18</span></p>
-    <input type="range" id="lag-slider" min="0.01" max="1" value="0.18" step="0.01" />
 
-    <hr style="margin:14px 0;border-color:#444" />
-    <h3 style="margin:0 0 8px">Slot Glow</h3>
-    <p>Line Width: <span id="glow-width-display">1</span></p>
-    <input type="range" id="glow-width-slider" min="0.5" max="5" value="1" step="0.1" />
-<p>Bloom Strength: <span id="bloom-strength-display">0.40</span></p>
-    <input type="range" id="bloom-strength-slider" min="0" max="3" value="0.6" step="0.05" />
-    <p>Bloom Radius: <span id="bloom-radius-display">0.25</span></p>
-    <input type="range" id="bloom-radius-slider" min="0" max="1" value="0.25" step="0.05" />
-    <p>Bloom Threshold: <span id="bloom-threshold-display">0.25</span></p>
-    <input type="range" id="bloom-threshold-slider" min="0" max="1" value="0.25" step="0.05" />
+    <!-- Scene tab -->
+    <div class="tab-panel" id="tab-scene">
+      <p>Scroll Progress: <span id="progress-display">0.00</span></p>
+      <input type="range" id="progress-slider" min="0" max="100" value="0" step="0.1" />
+      <div class="button-group">
+        <button id="reset-btn">Reset</button>
+        <button id="animate-btn">Auto Animate</button>
+      </div>
+      <p style="margin-top:14px">Mallet Lag: <span id="lag-display">0.18</span></p>
+      <input type="range" id="lag-slider" min="0.01" max="1" value="0.18" step="0.01" />
+    </div>
+
+    <!-- Bloom tab -->
+    <div class="tab-panel hidden" id="tab-bloom">
+      <p>Line Width: <span id="glow-width-display">1</span></p>
+      <input type="range" id="glow-width-slider" min="0.5" max="5" value="1" step="0.1" />
+      <p>Line Depth: <span id="glow-depth-display">0.00</span></p>
+      <input type="range" id="glow-depth-slider" min="0" max="2" value="0" step="0.01" />
+      <p>Bloom Strength: <span id="bloom-strength-display">0.40</span></p>
+      <input type="range" id="bloom-strength-slider" min="0" max="3" value="0.6" step="0.05" />
+      <p>Bloom Radius: <span id="bloom-radius-display">0.25</span></p>
+      <input type="range" id="bloom-radius-slider" min="0" max="1" value="0.25" step="0.05" />
+      <p>Bloom Threshold: <span id="bloom-threshold-display">0.25</span></p>
+      <input type="range" id="bloom-threshold-slider" min="0" max="1" value="0.25" step="0.05" />
+    </div>
+
+    <!-- Sparks tab (populated by JS) -->
+    <div class="tab-panel hidden" id="tab-sparks"></div>
   </div>
 
 <script type="module" src="/scene/scene-dev.js"></script>

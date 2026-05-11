@@ -113,10 +113,77 @@ body {
   background: rgba(20, 20, 20, 0.9);
   border: 1px solid #333;
   border-radius: 8px;
-  padding: 20px;
-  min-width: 280px;
+  padding: 16px;
+  width: 260px;
   z-index: 10;
   backdrop-filter: blur(10px);
+}
+
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.tab-btn {
+  flex: 1;
+  padding: 5px 4px;
+  font-size: 0.78rem;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: #666;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.tab-btn:hover {
+  color: #aaa;
+  border-color: #555;
+  background: #222;
+}
+
+.tab-btn.active {
+  background: #1a2a2a;
+  border-color: #00ffff;
+  color: #00ffff;
+}
+
+.tab-panel {
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+.tab-panel.hidden {
+  display: none;
+}
+
+#controls.hidden {
+  display: none;
+}
+
+.debug-row {
+  margin-bottom: 8px;
+}
+
+.debug-row p {
+  margin-bottom: 3px;
+}
+
+.debug-val {
+  font-weight: bold;
+  color: #00ffff;
+  font-family: 'Courier New', monospace;
+}
+
+h4.debug-section {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #555;
+  margin: 12px 0 6px;
+  border-top: 1px solid #2a2a2a;
+  padding-top: 10px;
 }
 
 #controls h2 {

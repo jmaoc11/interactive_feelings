@@ -33,9 +33,10 @@ assets/
     stonePng.png        (500×500px, no baked-in padding)
     stickPng.png        (500×500px, no baked-in padding)
   Models/
-    craftingtable.glb
-    craftingslots.glb       (empty Object3Ds Slot1–Slot9, position markers only)
-    craftingslotsfill.glb   (plane meshes Slot1–Slot9 filling each slot hole, used for edge extraction)
+    craftingGrid.glb        (current table model; contains Wood_Floor + Slot1–Slot9 fill planes + Grid_Inner; loaded twice — once as the table, once in loadSlotGlow for edge extraction)
+    craftingtable.glb       (legacy — no longer referenced)
+    craftingslots.glb       (legacy — empty Object3Ds Slot1–Slot9, no longer referenced)
+    craftingslotsfill.glb   (legacy — slot fill planes, no longer referenced)
     stone.glb
     stick.glb
     coal.glb
@@ -103,6 +104,7 @@ assets/
 - Restitution combine rules: table uses `CoefficientCombineRule.Max`, objects use `CoefficientCombineRule.Min` — gives table bounce without object-object bounce
 - Object-object collisions are intentionally less bouncy than object-table; don't flatten restitution globally
 - Body type switching: use `setBodyType(RigidBodyType.KinematicPositionBased)` / `setBodyType(RigidBodyType.Dynamic)` to toggle collision behavior (mallet, picked objects). Re-set `gravityScale(0)` after switching back to dynamic.
+- **KinematicPositionBased bodies stop at static colliders** — they sweep to target and get blocked by table geometry. Use `body.setTranslation(pos, true)` (direct teleport, no sweep) before `setNextKinematicTranslation` when picking up an object that may be embedded in the table (e.g. a fallen stick in a slot). Stones/coal sit on top so they're unaffected; sticks can sink into slot geometry.
 
 ## GLB Models
 - GLB origins are often **not centered** — always wrap in a pivot `Group`, offset `raw.position.sub(center)` after computing bbox, then scale the group
@@ -127,16 +129,38 @@ assets/
 - **Throw velocity**: tracked from cursor target position (not lagged position) via smoothed EMA; scaled by `THROW_SCALE` on release
 - **Interaction mode flag**: `CLICK_TOGGLE_ITEMS` (top of file) — `true` = click to grab/drop inventory items and picked objects; `false` = original hold-to-drag. Drop logic extracted into `releasePicked()` and `releaseInventoryDrag()` helpers used by both modes.
 
+## Table Model — `craftingGrid.glb` (`scene/scene-dev.js`)
+- Loaded as the rendered table in the main loader. The traverse hides two sets of meshes:
+  - `Wood_Floor` — not part of the table surface
+  - Any mesh matching `/^slot\d+$/i` — these are fill planes used only for slot edge extraction; rendering them would overlap the table surface
+- `addTablePhysics` applies the **same exclusion list** when building the trimesh collider — hidden meshes must also be skipped for physics, or invisible colliders sit on top of the table where the slot holes should be
+- `gridInner` (module-level) is the reference to the `Grid_Inner` mesh captured during traversal — used by the forge system to flip it to a glowing-white emissive when a recipe fuses
+
 ## Slot Glow (`scene/scene-dev.js`)
-- `loadSlotGlow()` loads `craftingslotsfill.glb`, extracts `EdgesGeometry` from each `Slot*` mesh, creates `LineSegments2` (fat line API) in world space
+- `loadSlotGlow()` re-loads `craftingGrid.glb` (separate from the rendered table copy) and extracts `EdgesGeometry` from each `Slot*` mesh, creates `LineSegments2` (fat line API) in world space
 - Only meshes matching `/^slot\d+$/i` are used — other meshes in the GLB (wood_grid, Object_*) are ignored
 - Edge vertices are transformed to world space via `slotMesh.matrixWorld` and offset +0.001 Y to avoid z-fighting with the table surface
 - `updateSlotGlow()` runs each frame: fades edge line opacity in/out; also checks `RECIPES` and lerps `bloomPass.strength` for recipe match feedback
 - Glow lines are on `BLOOM_LAYER` (layer 1) for selective bloom — only they bloom, not the rest of the scene
 - Tunable constants at top of file: `SLOT_GLOW_COLOR`, `SLOT_GLOW_COLOR_RECIPE`, `SLOT_GLOW_INTENSITY`, `SLOT_FILL_RADIUS`, `SLOT_DEPTH`
-- `stoneBodies` entries store `{ mesh, body, hy, slotIndex, debugMesh }` — `hy` is spawn-time Y half-extent, used for detection
+- `SLOT_FILL_RADIUS_STICK = 0.11` used for sticks (wider than stone's `SLOT_FILL_RADIUS = 0.06`) — stick axis can be offset from slot center when lying flat; tighter radius causes intermittent glow fade
+- `stoneBodies` entries store `{ mesh, body, hy, slotIndex }` — `hy` is spawn-time Y half-extent, used for detection
 - **Slot detection** — stones/coal: check `bottomY = t.y - hy` near `tableTopY`; sticks: find closest point on stick segment to slot center (body-local Z axis via quaternion rotation, clamped to `±hy`)
 - **Recipes**: `RECIPES` array of `{ slots: { 0-indexed-pos: itemType } }` — `slotItemType[]` tracks current item per crafting slot each frame; match triggers color + bloom change
+- **Exact match required**: a recipe matches only when every slot it specifies is filled AND every other slot is empty (`slotItemType[i] === -1`). `currentRecipeMatch` and `currentMatchedRecipe` are exposed module-level for the forge system to read.
+
+## Forge (`scene/scene-dev.js`)
+- Recipe-match + mallet table contact triggers a multi-step "fuse + morph" sequence handled by `handleForgeHammer()` (called from the mallet contact block in `updateMallet`, alongside the VFX spawn)
+- **State machine** — `forgeState`: `idle` → `forging` → `complete`. `forgeHammerCount` / `forgeHammerTotal` track progress; total is randomized per forge in `[FORGE_HAMMER_MIN, FORGE_HAMMER_MAX]` (currently 7–15)
+- **First hit (`startForge`)**: collects the matching `stoneBodies` entries per recipe slot (closest body to each slot center), merges their geometries with `BufferGeometryUtils.mergeGeometries` into a single bloom-layer glowing-white mesh (`fusedMesh`), then removes the originals (mesh from parent, body from world, entry from `stoneBodies`). `Grid_Inner` material is swapped to glowing white and saved to `gridInnerOriginalMaterial` for potential restore.
+- **Merge gotcha**: items are pivot Groups, so `buildFusedMesh` traverses each entry to collect leaf Meshes; non-position attributes are stripped before merging so geometries with different attribute layouts can combine
+- **Subsequent hits (`compressForge`)**: each bumps `morphTargetProgress` by `1 / (total - 1)` and applies a Y-squash punch (`FORGE_COMPRESS_Y` / `FORGE_WIDEN_XZ`). Scale lerps toward `fusedTargetScale` each frame in `updateForge`, but only while state is `forging` so it doesn't fight the morph after completion.
+- **Morph algorithm (`computeMorphTarget`)**: for each fused-mesh vertex, find the nearest point on the result geometry's surface via `THREE.Triangle.closestPointToPoint`. Vertex counts don't need to match — the fused mesh's own vertex array gets redirected. Works for any target topology, but nearest-point can fold on concave targets.
+- **Target sizing**: result mesh is scaled to `targetMaxDim = max(srcSize) * <ratio>` (currently 0.3 for an obvious cube). Bump the ratio up if the morph is too dramatic.
+- **Result geometry hook**: `forgeResultGeometry` (default `BoxGeometry(1,1,1)`) is the shape the fused mesh morphs into. Swap with the exported `setForgeResult(geoOrMesh)` — accepts a `BufferGeometry` or a `Mesh` (in which case the mesh's transform is baked in).
+- **Completion hook**: `onForgeComplete(mesh)` fires when the final hammer lands (morph reaches 1.0 a few frames later via the lerp). Override to chain follow-up effects.
+- **Tunables at the top of the forge section**: `FORGE_HAMMER_MIN/MAX`, `FORGE_COMPRESS_Y`, `FORGE_WIDEN_XZ`, `FORGE_EMISSIVE_INTENSITY`, `FORGE_GLOW_COLOR`, `FORGE_SCALE_LERP`, `MORPH_LERP`
+- The fused mesh has **no physics body** — the mallet still stops at the table-top contact check. If you want the mallet head to physically rest on the blob, add a kinematic cuboid sized to `fusedMesh`'s bbox.
 
 ## Selective Bloom (`scene/scene-dev.js`)
 - Two-composer setup: `bloomComposer` renders only bloom-layer objects (all others darkened to black), `composer` composites bloom additively over normal render via a custom `ShaderPass`
@@ -145,7 +169,17 @@ assets/
 - `LineMaterial` linewidth also adjustable via debug panel
 - Resize handler updates both composers and all `LineMaterial` resolutions
 
+## Debug Panel (`scene/index.html` + `scene/scene-dev.js`)
+- Three tabs: **Scene** (progress, mallet lag), **Bloom** (line width, bloom strength/radius/threshold), **Sparks** (all `vfx*` params)
+- Tab switching: pure CSS `.hidden` class + JS `querySelectorAll('.tab-btn')` click handler in `setupControls()`
+- Sparks tab built entirely in JS via `makeSlider()` helper — keeps HTML clean; sliders grouped by `makeSectionHead()` into Burst / Speed / Lifetime / Physics / Particles
+- **Hidden by default** (`<div id="controls" class="hidden">`); press `,` to toggle. The keydown handler in `setupControls` ignores the key while focus is in an `input`/`textarea`/`select`. CSS rule `#controls.hidden { display: none }` is separate from `.tab-panel.hidden` — adding the class to `#controls` requires its own rule.
+
 ## VFX (`scene/scene-dev.js`)
 - `spawnCraftVFX(worldPos)` — fires on mallet swing hitting the table; triggered by `malletContactPos` being set
 - Hit detection uses XZ footprint check + `headPt.y <= tableBox.max.y + 0.15` — NOT full 3D bbox containment (which misses slot hits)
 - Particle count, size, speed, gravity all tunable at top of `spawnCraftVFX`
+- `USE_3D_VFX` toggle (top of file) — `true` = 3D blocky cube sparks with bloom + trails; `false` = 2D CSS overlay fallback
+- 3D sparks: `spawn3DVfx(worldPos)` / `update3DVfx(dt)` — `BoxGeometry` cubes on `BLOOM_LAYER`, per-particle `MeshBasicMaterial` (need independent opacity), trail via `THREE.Line` with shifting position buffer (length: `SPARK_TRAIL_LENGTH`)
+- All 3D spark params are mutable module-level `vfx*` vars (count, speedMin/Max, coneMin/Max, decayMin/Max, gravity, upKick, sizeMin/Max, trailOpacity) — driven live by debug panel Sparks tab
+- Contact point: `new THREE.Vector3(headPt.x - faceNormal.x * offset, tableBox.max.y, headPt.z - faceNormal.z * offset)` where `faceNormal` = mallet local +Y projected onto XZ — offsets from raised rim toward flat face center
