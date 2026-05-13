@@ -105,7 +105,9 @@ const stoneBodies = []; // { mesh, body }
 let composer = null;
 let bloomComposer = null;
 let bloomPass = null;
+let bloomMaskRT = null; // unblurred bloom-only render, used as occlusion mask in final composite
 let bloomBaseStrength = 0.45; // controlled by debug slider
+const BLOOM_ENABLED = true; // false = skip bloom pipeline entirely (debug)
 const DEFAULT_LINE_WIDTH = 2;
 const BLOOM_LAYER = 1;
 const bloomLayer = new THREE.Layers();
@@ -131,15 +133,20 @@ let slotDepth = DEFAULT_SLOT_DEPTH;
 // Crafting recipes — slots are 1-indexed in comments, 0-indexed in code
 // Item types: 0 = stone, 1 = stick, 2 = coal
 const RECIPES = [
-  { slots: { 0: 0, 1: 0, 2: 0, 4: 1, 7: 1 } }, // stone1,stone2,stone3 + stick5,stick8
+  { name: 'Stone Pick', result: '/assets/Models/stonePick.glb', slots: { 0: 0, 1: 0, 2: 0, 4: 1, 7: 1 } }, // stone1,stone2,stone3 + stick5,stick8
   { slots: { 4: 0 } },                          // stone in center slot
 ];
+
+// Cache of preloaded GLB geometries used as forge morph results, keyed by path.
+const recipeResultCache = {};
+// Cache of preloaded GLB scenes (with materials) used as the post-morph hand-off mesh.
+const recipeResultSceneCache = {};
 
 // ─── Forge state ──────────────────────────────────────────────────────────────
 // Recipe match + hammer → fuse items into a single glowing mesh, compress each
 // subsequent hit, then hand off to onForgeComplete for the morph-to-result step.
-const FORGE_HAMMER_MIN        = 7;     // inclusive lower bound for randomized hammer total
-const FORGE_HAMMER_MAX        = 15;    // inclusive upper bound
+const FORGE_HAMMER_MIN        = 4;     // inclusive lower bound for randomized hammer total
+const FORGE_HAMMER_MAX        = 8;     // inclusive upper bound
 const FORGE_COMPRESS_Y        = 0.93;  // Y-scale multiplier per compress hit (subtle — morph is the main visual)
 const FORGE_WIDEN_XZ          = 1.015; // XZ-scale multiplier per compress hit
 const FORGE_EMISSIVE_INTENSITY = 2.0;
@@ -150,6 +157,7 @@ let gridInner = null;
 let gridInnerOriginalMaterial = null;
 let gridFloor = null;
 let woodFloor = null;
+let gridWalls = null;
 let forgeState = 'idle';        // 'idle' | 'forging' | 'complete'
 let forgeHammerCount = 0;
 let forgeHammerTotal = 0;        // randomized FORGE_HAMMER_MIN..MAX per forge
@@ -165,6 +173,49 @@ let morphProgress = 0;           // displayed progress (0..1)
 let morphTargetProgress = 0;     // target progress, advances one step per hammer
 let morphOriginalPositions = null;
 let morphTargetPositions = null;
+let pendingResultMesh = null; // pre-cloned real GLB, swapped in when morph reaches 1.0
+// Result fade-back: when the real GLB swaps in, every leaf material starts as a
+// clone with bright white emissive; emissive lerps to 0 over RESULT_FADE_DURATION,
+// then originals are restored.
+let resultFadeMesh = null;
+let resultFadeT = 0;
+const RESULT_FADE_DURATION = 1.5;
+const resultFadeOriginals = new Map();
+
+function startResultFade(mesh) {
+  resultFadeMesh = mesh;
+  resultFadeT = 0;
+  resultFadeOriginals.clear();
+  mesh.traverse((c) => {
+    if (!c.isMesh || !c.material) return;
+    resultFadeOriginals.set(c, c.material);
+    const glowMat = c.material.clone();
+    glowMat.emissive = new THREE.Color(0xffffff);
+    glowMat.emissiveIntensity = FORGE_EMISSIVE_INTENSITY;
+    c.material = glowMat;
+    c.layers.enable(BLOOM_LAYER);
+  });
+}
+
+function updateResultFade(dt) {
+  if (!resultFadeMesh) return;
+  resultFadeT += dt / RESULT_FADE_DURATION;
+  const done = resultFadeT >= 1;
+  resultFadeMesh.traverse((c) => {
+    if (!c.isMesh || !c.material) return;
+    if (done) {
+      const orig = resultFadeOriginals.get(c);
+      if (orig) c.material = orig;
+      c.layers.disable(BLOOM_LAYER);
+    } else {
+      c.material.emissiveIntensity = FORGE_EMISSIVE_INTENSITY * (1 - resultFadeT);
+    }
+  });
+  if (done) {
+    resultFadeOriginals.clear();
+    resultFadeMesh = null;
+  }
+}
 
 // Result-mesh geometry — defaults to a cube. Swap via setForgeResult(geo) or pass any
 // BufferGeometry / Mesh. Morph pulls each fused-mesh vertex to its nearest point on
@@ -185,12 +236,14 @@ export function setForgeResult(geoOrMesh) {
 // For each src vertex, find the nearest point on the target mesh's surface.
 // Result positions are in src-local space (so they can be assigned straight to
 // src.geometry.attributes.position) and sized to roughly match the src world bbox.
-function computeMorphTarget(srcGeo, tgtGeo, srcScale) {
+function computeMorphTarget(srcGeo, tgtGeo, srcScale, scaleFactor = 0.3) {
   srcGeo.computeBoundingBox();
+  const srcCenter = new THREE.Vector3();
+  srcGeo.boundingBox.getCenter(srcCenter);
   const srcSize = new THREE.Vector3();
   srcGeo.boundingBox.getSize(srcSize);
   srcSize.multiply(srcScale);
-  const targetMaxDim = Math.max(srcSize.x, srcSize.y, srcSize.z) * 0.3;
+  const targetMaxDim = Math.max(srcSize.x, srcSize.y, srcSize.z) * scaleFactor;
 
   tgtGeo.computeBoundingBox();
   const tgtCenter = new THREE.Vector3();
@@ -200,13 +253,27 @@ function computeMorphTarget(srcGeo, tgtGeo, srcScale) {
   const tgtMax = Math.max(tgtSize.x, tgtSize.y, tgtSize.z) || 1;
   const tgtFit = targetMaxDim / tgtMax;
 
+  // Axis alignment: map target's longest axis to source's longest axis, etc.
+  // Without this, a pickaxe (long along Z) tried to morph onto a row of items
+  // (long along X) gives a rotated/diamond result.
+  const srcDims = [srcSize.x, srcSize.y, srcSize.z];
+  const tgtDims = [tgtSize.x, tgtSize.y, tgtSize.z];
+  const srcOrder = [0, 1, 2].sort((a, b) => srcDims[b] - srcDims[a]);
+  const tgtOrder = [0, 1, 2].sort((a, b) => tgtDims[b] - tgtDims[a]);
+  const axisFromSrc = [0, 0, 0]; // axisFromSrc[srcAxis] = tgtAxis
+  for (let k = 0; k < 3; k++) axisFromSrc[srcOrder[k]] = tgtOrder[k];
+
   // Build target triangles in src-local space (world / srcScale, centered at origin).
   const inv = new THREE.Vector3(1 / srcScale.x, 1 / srcScale.y, 1 / srcScale.z);
+  const tgtCenterArr = [tgtCenter.x, tgtCenter.y, tgtCenter.z];
+  const invArr = [inv.x, inv.y, inv.z];
   const remap = (out, ax, ay, az) => {
+    const t = [ax, ay, az];
+    // For each src axis, pull from the corresponding target axis (axis-aligned remap).
     out.set(
-      ((ax - tgtCenter.x) * tgtFit) * inv.x,
-      ((ay - tgtCenter.y) * tgtFit) * inv.y,
-      ((az - tgtCenter.z) * tgtFit) * inv.z,
+      ((t[axisFromSrc[0]] - tgtCenterArr[axisFromSrc[0]]) * tgtFit) * invArr[0],
+      ((t[axisFromSrc[1]] - tgtCenterArr[axisFromSrc[1]]) * tgtFit) * invArr[1],
+      ((t[axisFromSrc[2]] - tgtCenterArr[axisFromSrc[2]]) * tgtFit) * invArr[2],
     );
   };
   const tgtPos = tgtGeo.attributes.position.array;
@@ -227,13 +294,34 @@ function computeMorphTarget(srcGeo, tgtGeo, srcScale) {
   const srcArr = srcGeo.attributes.position.array;
   const out = new Float32Array(srcArr.length);
   const v = new THREE.Vector3(), p = new THREE.Vector3(), best = new THREE.Vector3();
+  const dir = new THREE.Vector3(), ray = new THREE.Ray();
   for (let i = 0; i < srcArr.length / 3; i++) {
     v.set(srcArr[i*3], srcArr[i*3+1], srcArr[i*3+2]);
-    let bestD = Infinity;
-    for (const tri of triangles) {
-      tri.closestPointToPoint(v, p);
-      const d = v.distanceToSquared(p);
-      if (d < bestD) { bestD = d; best.copy(p); }
+    // Ray-cast wrap: shoot a ray from src centroid through this vert; the furthest
+    // target hit gives a uniform-ish "wrap" mapping (verts distribute around the
+    // target's silhouette instead of clumping at convex tips like nearest-point).
+    dir.subVectors(v, srcCenter);
+    let foundHit = false;
+    let bestT = -Infinity;
+    if (dir.lengthSq() > 1e-10) {
+      dir.normalize();
+      ray.origin.copy(srcCenter);
+      ray.direction.copy(dir);
+      for (const tri of triangles) {
+        if (ray.intersectTriangle(tri.a, tri.b, tri.c, false, p)) {
+          const t = p.distanceTo(srcCenter);
+          if (t > bestT) { bestT = t; best.copy(p); foundHit = true; }
+        }
+      }
+    }
+    if (!foundHit) {
+      // Fallback to nearest-point on surface (rare — vert at centroid, or shape doesn't enclose ray).
+      let bestD = Infinity;
+      for (const tri of triangles) {
+        tri.closestPointToPoint(v, p);
+        const d = v.distanceToSquared(p);
+        if (d < bestD) { bestD = d; best.copy(p); }
+      }
     }
     out[i*3]     = best.x;
     out[i*3 + 1] = best.y;
@@ -263,7 +351,17 @@ function updateMorph(dt) {
       + ' inScene=' + !!fusedMesh.parent
       + ' visible=' + fusedMesh.visible);
   }
-  if (forgeState === 'complete' && Math.abs(morphProgress - 1) < 0.001) morphActive = false;
+  if (forgeState === 'complete' && Math.abs(morphProgress - 1) < 0.001) {
+    morphActive = false;
+    // Swap the lumpy morph for the clean real GLB, starting at glowing white.
+    if (pendingResultMesh) {
+      pendingResultMesh.visible = true;
+      startResultFade(pendingResultMesh);
+      if (fusedMesh.parent) fusedMesh.parent.remove(fusedMesh);
+      fusedMesh = null;
+      pendingResultMesh = null;
+    }
+  }
 }
 
 // ─── Sphere→Cube morph smoke test ─────────────────────────────────────────────
@@ -527,7 +625,7 @@ function createSlotWall(positionsTop, depth) {
 }
 
 function loadSlotGlow() {
-  loader.load('/assets/Models/craftingGrid.glb', (gltf) => {
+  loader.load('/assets/Models/craftingGrid2.glb', (gltf) => {
     const slotsRoot = gltf.scene;
     slotsRoot.updateMatrixWorld(true);
 
@@ -751,11 +849,20 @@ function startForge(recipe) {
   const items = collectForgeItems(recipe);
   if (items.length === 0) return;
 
-  // Fuse converges at the center slot (slot 4), which sits at the middle of the grid.
+  // Fuse converges at the center slot (slot 4). Y is anchored to Wood_Floor's
+  // world Y so the merged mesh rests on it (buildFusedMesh shifts the geometry
+  // so its bbox bottom = mesh.position.y).
   const fuseCenter = slotCenters[4] ? slotCenters[4].clone() : null;
+  if (fuseCenter && woodFloor) {
+    woodFloor.updateWorldMatrix(true, false);
+    const wbox = new THREE.Box3().setFromObject(woodFloor);
+    fuseCenter.y = wbox.max.y;
+  }
 
   // Merge Grid_Inner into the fused mesh alongside the dropped items, then detach
-  // Grid_Inner from the table so the original isn't visible underneath.
+  // Grid_Inner from the table so the original isn't visible underneath. With
+  // craftingGrid2.glb Grid_Inner has its own geometry, so detaching no longer
+  // pulls faces from Grid_Walls.
   const meshList = items.map((it) => it.mesh);
   if (gridInner) meshList.push(gridInner);
 
@@ -771,14 +878,28 @@ function startForge(recipe) {
     if (idx !== -1) stoneBodies.splice(idx, 1);
   }
 
-  // Detach Grid_Inner from the table model — its geometry is now part of fusedMesh.
+  // Detach Grid_Inner from the table — its geometry is now part of fusedMesh.
   if (gridInner && gridInner.parent) {
     gridInnerOriginalMaterial = gridInner.material;
     gridInner.parent.remove(gridInner);
   }
 
-  // Hide Grid_Floor; reveal Wood_Floor as the bright glowing replacement.
-  console.log('[forge] gridFloor=', gridFloor?.name, 'woodFloor=', woodFloor?.name, 'woodFloor.visible(before)=', woodFloor?.visible);
+  // Hide slot edge lines + bottom walls entirely during/after forge. Zeroing opacity
+  // wasn't enough — the bloom pass still amplifies even fully-transparent transparent
+  // surfaces if they linger in the bloom layer. visible=false is bulletproof.
+  for (let i = 0; i < slotEdgeLines.length; i++) {
+    if (slotEdgeLines[i]) {
+      slotEdgeLines[i].material.opacity = 0;
+      slotEdgeLines[i].visible = false;
+    }
+    if (slotEdgeLinesBottom[i]) {
+      slotEdgeLinesBottom[i].material.opacity = 0;
+      slotEdgeLinesBottom[i].visible = false;
+    }
+    slotFilled[i] = false;
+  }
+
+  // Hide Grid_Floor; reveal Wood_Floor.
   if (gridFloor) gridFloor.visible = false;
   if (woodFloor) woodFloor.visible = true;
 
@@ -789,11 +910,54 @@ function startForge(recipe) {
 
   // Snapshot current vertex positions as morph source; target positions are the
   // nearest points on forgeResultGeometry. Each hammer hit advances morphTargetProgress.
+  // Recipe-specific morph target (e.g. Stone Pick) overrides the default cube.
+  // Use a natural-size scale factor when a recipe supplies a result mesh, so the
+  // pickaxe (or whatever) reads at its real proportions instead of a thumbnail.
+  const hasRecipeResult = recipe.result && recipeResultCache[recipe.result];
+  const resultGeo = hasRecipeResult ? recipeResultCache[recipe.result] : forgeResultGeometry;
+  const resultScale = hasRecipeResult ? 1.0 : 0.3;
   morphOriginalPositions = new Float32Array(fusedMesh.geometry.attributes.position.array);
-  morphTargetPositions = computeMorphTarget(fusedMesh.geometry, forgeResultGeometry, fusedMesh.scale);
+  morphTargetPositions = computeMorphTarget(fusedMesh.geometry, resultGeo, fusedMesh.scale, resultScale);
   morphProgress = 0;
   morphTargetProgress = 0;
   morphActive = true;
+
+  // Shift the morph target up so the final cube's bottom rests on mesh.position.y
+  // (= Wood_Floor top). Source verts unchanged, so the initial blob keeps items at
+  // their natural world positions.
+  let tgtMinY = Infinity;
+  for (let i = 1; i < morphTargetPositions.length; i += 3) {
+    if (morphTargetPositions[i] < tgtMinY) tgtMinY = morphTargetPositions[i];
+  }
+  if (Number.isFinite(tgtMinY) && tgtMinY !== 0) {
+    for (let i = 1; i < morphTargetPositions.length; i += 3) morphTargetPositions[i] -= tgtMinY;
+  }
+
+  // Prepare the hand-off mesh: a clone of the real GLB sized to match the morph
+  // target and positioned with its bottom on Wood_Floor. Stays hidden until the
+  // morph finishes, then swaps in for fusedMesh.
+  if (pendingResultMesh) { scene.remove(pendingResultMesh); pendingResultMesh = null; }
+  if (hasRecipeResult && recipeResultSceneCache[recipe.result]) {
+    pendingResultMesh = recipeResultSceneCache[recipe.result].clone(true);
+    pendingResultMesh.updateMatrixWorld(true);
+    const naturalBox = new THREE.Box3().setFromObject(pendingResultMesh);
+    const naturalSize = naturalBox.getSize(new THREE.Vector3());
+    const naturalMax = Math.max(naturalSize.x, naturalSize.y, naturalSize.z) || 1;
+    // Match the morph target's world maxDim: srcMaxDim * resultScale (uniform).
+    fusedMesh.geometry.computeBoundingBox();
+    const sBox = fusedMesh.geometry.boundingBox;
+    const sSize = new THREE.Vector3(); sBox.getSize(sSize);
+    const srcMax = Math.max(sSize.x, sSize.y, sSize.z) || 1;
+    const targetWorldMax = srcMax * resultScale;
+    pendingResultMesh.scale.setScalar(targetWorldMax / naturalMax);
+    pendingResultMesh.position.copy(fusedMesh.position);
+    pendingResultMesh.visible = false;
+    scene.add(pendingResultMesh);
+    // After adding, align bottom of result mesh to Wood_Floor top.
+    pendingResultMesh.updateMatrixWorld(true);
+    const finalBox = new THREE.Box3().setFromObject(pendingResultMesh);
+    pendingResultMesh.position.y += (fusedMesh.position.y - finalBox.min.y);
+  }
 }
 
 function compressForge() {
@@ -933,13 +1097,15 @@ async function init() {
   scene.add(directionalLight);
 
   // Load crafting table
-  loader.load('/assets/Models/craftingGrid.glb', (gltf) => {
+  loader.load('/assets/Models/craftingGrid3.glb', (gltf) => {
     const model = gltf.scene;
     model.traverse((child) => {
+      if (child.isMesh) console.log('[table mesh]', JSON.stringify(child.name));
       if (child.name === 'Wood_Floor' || /^slot\d+$/i.test(child.name)) child.visible = false;
       if (child.isMesh && child.name === 'Grid_Inner') gridInner = child;
       if (child.isMesh && child.name === 'Grid_Floor') gridFloor = child;
       if (child.isMesh && child.name === 'Wood_Floor') woodFloor = child;
+      if (child.isMesh && child.name === 'Grid_Walls') gridWalls = child;
     });
     scene.add(model);
     objects.push(model);
@@ -974,6 +1140,35 @@ async function init() {
   loadSlotModel(0, '/assets/Models/stone.glb', 0.16);
   loadSlotModel(1, '/assets/Models/stick.glb', 0.175, { x: 1.3, y: 1.3, z: 1.3 });
   loadSlotModel(2, '/assets/Models/coal.glb', 0.16);
+
+  // Preload result GLBs for any recipe that specifies one. Merge all leaf
+  // geometries into a single non-indexed BufferGeometry suitable as a morph target.
+  for (const recipe of RECIPES) {
+    if (!recipe.result || recipeResultCache[recipe.result]) continue;
+    const path = recipe.result;
+    loader.load(path, (gltf) => {
+      const geos = [];
+      gltf.scene.updateWorldMatrix(true, false);
+      gltf.scene.traverse((c) => {
+        if (!c.isMesh || !c.geometry) return;
+        c.updateWorldMatrix(true, false);
+        const g = c.geometry.clone();
+        for (const name of Object.keys(g.attributes)) {
+          if (name !== 'position') g.deleteAttribute(name);
+        }
+        g.applyMatrix4(c.matrixWorld);
+        geos.push(g);
+      });
+      if (geos.length) {
+        const merged = BufferGeometryUtils.mergeGeometries(geos, false);
+        recipeResultCache[path] = merged;
+      } else {
+        console.warn('[recipe result] no meshes found in', path);
+      }
+      // Cache the full scene with materials for the post-morph swap.
+      recipeResultSceneCache[path] = gltf.scene;
+    });
+  }
 
   controls = new OrbitControls(camera, canvas);
   controls.target.set(0, 0, 0);
@@ -1753,6 +1948,7 @@ function animate() {
   updateVFX(dt);
   update3DVfx(dt);
   updateForge(dt);
+  updateResultFade(dt);
   updateSphereToCubeTest(dt);
 
   if (autoAnimate) {
@@ -1764,12 +1960,17 @@ function animate() {
   controls.update();
   updateSlotGlow();
 
-  // Selective bloom: darken non-bloom objects, render bloom pass, restore
-  scene.traverse(darkenNonBloom);
-  bloomComposer.render();
-  scene.traverse(restoreMaterial);
+  if (BLOOM_ENABLED) {
+    // Selective bloom: darken non-bloom objects, render bloom pass, restore
+    scene.traverse(darkenNonBloom);
+    bloomComposer.render();
+    scene.traverse(restoreMaterial);
 
-  composer.render();
+    composer.render();
+  } else {
+    // Bypass bloom — render scene directly. Diagnostic toggle.
+    renderer.render(scene, camera);
+  }
 }
 
 function onResize() {
